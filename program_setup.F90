@@ -28,6 +28,10 @@ logical, public             :: output_intermediate_files_up = .false. ! If true,
 logical, public             :: output_intermediate_files_down = .false. ! If true, output a file for each intermediate mesh when progressively downscaling
 logical, public             :: output_blended_edge_normal_wind = .false. ! If true, output blended edge normal wind (u)
 logical, public             :: esmf_log = .false. ! logging information
+logical, public             :: smooth_going_downscale = .false. ! If true, run a smoother after interpolating downscale when reconstructing fields
+real,    public             :: smoother_dimensionless_coefficient = 0.0 ! Not used if smooth_going_downscale = .false.; parameter for smoothing
+integer, public             :: max_boundary_layer_to_keep = 7 ! The largest boundary cell (bdyMaskCell) for which we'll use in the interpolation
+
 
 ! Public namelist &latlon_output variables
 logical, public            :: output_latlon_grid = .false. ! Switch to turn on lat-lon output (for diagnostics purposes)
@@ -45,16 +49,19 @@ public :: read_setup_namelist
 namelist /share/ large_scale_file, small_scale_file, output_blended_filename, &
          variables_to_blend, grid_info_file, interp_method, &
          average_upscale_before_interp, output_intermediate_files_up, &
-         output_intermediate_files_down, output_blended_edge_normal_wind, esmf_log
+         output_intermediate_files_down, output_blended_edge_normal_wind, esmf_log, &
+         smooth_going_downscale, smoother_dimensionless_coefficient, &
+         max_boundary_layer_to_keep
 
 namelist /latlon_output/ output_latlon_grid, is_regional, &
                          nlat, nlon, lat_ll, lon_ll, dx_in_degrees
 
 contains
 
-subroutine read_setup_namelist(filename)
+subroutine read_setup_namelist(filename,localpet)
 
    character(len=*), intent(in) :: filename
+   integer, intent(in) :: localpet
 
    integer :: i, ierr, unum
  
@@ -82,6 +89,17 @@ subroutine read_setup_namelist(filename)
    else
      LogType = ESMF_LOGKIND_NONE
    endif 
+
+   ! Check bounds on max_boundary_layer_to_keep
+   if ( max_boundary_layer_to_keep > 7 ) then
+      if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 7'
+      max_boundary_layer_to_keep = 7
+   endif
+
+   if ( max_boundary_layer_to_keep < 1 ) then
+      if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 1'
+      max_boundary_layer_to_keep = 1
+   endif
  
 end subroutine read_setup_namelist
 

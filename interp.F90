@@ -3,8 +3,8 @@ module interp
 use mpi
 use esmf
 use netcdf
-use utils_mod, only : error_handler
-use model_grid, only : mpas_mesh_type, mask_value
+use utils_mod, only : error_handler, sphere_distance
+use model_grid, only : mpas_mesh_type, mask_value, INSIDE, UNMARKED
 use input_data, only : nVertLevelsPerVariable
 
 implicit none
@@ -12,12 +12,10 @@ implicit none
 private
  
 ! Public subroutines
-public :: interp_data, radially_average
+public :: interp_data, radially_average, apply_smoothing_filter
 
 ! Variables private to this module
 integer ::  isrctermprocessing = 1
-integer, parameter :: INSIDE = 0
-integer, parameter :: UNMARKED = -1
 integer, parameter :: num_neigh_max = 1000 ! max number of points in a neighborhood about a point
 real,    parameter :: PI = 3.14159265359
 real :: start, finish
@@ -31,12 +29,18 @@ subroutine interp_data(localpet,input_bundle,target_bundle,my_interp_method)
    type(esmf_fieldbundle), intent(in)    :: input_bundle
    type(esmf_fieldbundle), intent(inout) :: target_bundle
    character(len=*), intent(in)          :: my_interp_method
-   integer                          :: rc, i, nfields, ungriddedDimCount
+   integer                          :: rc, i, nfields, ungriddedDimCount, k
    integer                          :: ungriddedUBound(10), ungriddedLBound(10)
    character(len=500), allocatable    :: field_names(:)
    type(ESMF_RegridMethod_Flag)     :: method
    type(ESMF_RouteHandle)           :: my_rh
    type(ESMF_Field), allocatable    :: fields_input_grid(:), fields_target_grid(:)
+
+   real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
+   type(ESMF_Mesh) :: mesh
+   integer :: elementCount
+   integer, allocatable :: elementMask(:)
+   type(ESMF_GeomType_Flag) :: geomtype
     
    !if ( ESMF_RouteHandleIsCreated(routehandle, rc=rc)) then   ... 
 
@@ -107,6 +111,36 @@ subroutine interp_data(localpet,input_bundle,target_bundle,my_interp_method)
       call ESMF_FieldRegrid(fields_input_grid(i), fields_target_grid(i), my_rh, rc=rc)
       if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
          call error_handler("IN FieldRegrid", rc)
+
+      ! kind of a test...where masked, force the interpolated field to missing
+      !  .... doesn't seem to be working ... 
+      call ESMF_FieldBundleGet(target_bundle, geomtype=geomtype)
+      if ( geomtype == ESMF_GEOMTYPE_MESH ) then ! only do if it's a mesh-to-mesh interpolation.
+     !if ( 1 == 2 ) then
+         if(localpet==0) write(*,*)'resetting interpolated values outside mask to mask_value'
+         call ESMF_FieldBundleGet(target_bundle, mesh=mesh)
+         call ESMF_MeshGet(mesh, elementCount=elementCount)
+         allocate(elementMask(elementCount))
+         call ESMF_MeshGet(mesh, elementMask=elementMask)
+         if ( nVertLevelsPerVariable(i) == 1 ) then
+            call ESMF_FieldGet(fields_target_grid(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
+            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
+               call error_handler("IN FieldGet", rc)
+            where( elementMask == mask_value ) varptr = real(mask_value,esmf_kind_r8)
+            nullify(varptr)
+         else
+            call ESMF_FieldGet(fields_target_grid(i), farrayPtr=varptr2, rc=rc) ! varptr2 is decomposed across all processors
+            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
+               call error_handler("IN FieldGet", rc)
+            do k = 1,nVertLevelsPerVariable(i)
+               where( elementMask == mask_value ) varptr2(:,k) = real(mask_value,esmf_kind_r8)
+            enddo
+            nullify(varptr2)
+         endif
+         deallocate(elementMask)
+      endif
+      ! end test
+
    enddo
 
    ! update the fields in target_bundle
@@ -361,15 +395,19 @@ recursive subroutine find_neighborhoods(my_cell, lat_center, lon_center, averagi
 
    integer :: i, j, iCell
 
-   if ( central_cell ) then
+   if ( central_cell ) then ! only true for the central cell
       mask(my_cell) = tval ! mark the central cell
       n = n + 1
       indices(n) = my_cell
+
+      ! if the central cell is masked, return now and don't average for that cell; just use the point value
+      if ( bdyMaskCell(my_cell) == mask_value ) return  ! get out of the subroutine
    endif
+
 
    do i=1, nEdgesOnCell(my_cell)
       iCell = cellsOnCell(i, my_cell)
-     !if (bdyMaskCell(iCell) == mask_value ) cycle ! don't include points we are masking out in the averaging
+      if (bdyMaskCell(iCell) == mask_value ) cycle ! don't include points we are masking out in the averaging
       if (mask(iCell) == tval) cycle
       if (sphere_distance(lat_center, lon_center, latCell(iCell), lonCell(iCell), mpas_mesh_radius) <= averaging_radius ) then
          mask(iCell) = tval
@@ -387,17 +425,144 @@ recursive subroutine find_neighborhoods(my_cell, lat_center, lon_center, averagi
 
 end subroutine find_neighborhoods
 
-real function sphere_distance(lat1, lon1, lat2, lon2, radius)
+subroutine apply_smoothing_filter(localpet,mpas_mesh,smoother_dimensionless_coefficient,bundle)
+   integer, intent(in)                   :: localpet
+   type(mpas_mesh_type),   intent(in)    :: mpas_mesh
+   real,                   intent(in)    :: smoother_dimensionless_coefficient
+   type(esmf_fieldbundle), intent(inout) :: bundle
 
-      implicit none
+   integer                         :: rc, i, j, k, iCell, nfields, nz
+   integer                         :: iEdge, cell1, cell2
+   real                            :: averaging_radius_meters, area_sum
+   real                            :: smoother_coefficient, smoother_flux
+   character(len=500), allocatable :: field_names(:)
+   type(ESMF_Field), allocatable   :: fields(:)
+   real(esmf_kind_r8), allocatable :: field1d(:), field2d(:,:)
+   real*8, allocatable :: field_filtered1d(:), field_filtered2d(:,:)
+   real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
 
-      real, intent(in) :: lat1, lon1, lat2, lon2, radius
-      real :: arg1
+   ! get the number of fields from the bundle
+   call ESMF_FieldBundleGet(bundle, fieldCount=nfields, &
+                             itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet fieldCount", rc)
 
-      arg1 = sqrt( sin(0.5*(lat2-lat1))**2 +  &
-                 cos(lat1)*cos(lat2)*sin(0.5*(lon2-lon1))**2 )
-      sphere_distance = 2.*radius*asin(arg1)
+   ! get the names of the fields from the bundle (just for printing purposes)
+   allocate(field_names(nfields))
+   call ESMF_FieldBundleGet(bundle, fieldNameList=field_names, &
+                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet fieldNameList", rc)
 
-end function sphere_distance
+   ! get the input fields
+   allocate(fields(nfields))
+   call ESMF_FieldBundleGet(bundle, fieldList=fields, &
+                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet", rc)
+
+   do i = 1,nfields
+   
+      if (localpet==0) write(*,*)"- SMOOTHING "//trim(adjustl(field_names(i)))
+
+      if ( nVertLevelsPerVariable(i) == 1 ) then
+        !if (localpet==0) then
+            allocate(field1d(mpas_mesh%nCells))
+        !else
+        !   allocate(field1d(0))
+        !endif
+
+         ! gather onto process 0
+         call ESMF_FieldGather(fields(i), field1d, rootPet=0, rc=rc)
+         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
+            call error_handler("IN FieldGather", rc)
+
+         ! do the smoothing on process 0
+         allocate(field_filtered1d(mpas_mesh%nCells))
+         if ( localpet == 0 ) then
+            field_filtered1d(:) =  field1d(:)
+            do iEdge=1,mpas_mesh%nEdges
+               cell1 = mpas_mesh%cellsOnEdge(1,iEdge)
+               cell2 = mpas_mesh%cellsOnEdge(2,iEdge)
+               if (cell1 <= mpas_mesh%nCells .or. cell2 <= mpas_mesh%nCells) then
+                  smoother_coefficient = 0.5*smoother_dimensionless_coefficient*(mpas_mesh%areaCell(cell1)+mpas_mesh%areaCell(cell2))
+                  smoother_flux = smoother_coefficient*mpas_mesh%dvEdge(iEdge)*(field1d(cell2) - field1d(cell1))/mpas_mesh%dcEdge(iEdge)
+                  field_filtered1d(cell1) = field_filtered1d(cell1) + smoother_flux/mpas_mesh%areaCell(cell1)
+                  field_filtered1d(cell2) = field_filtered1d(cell2) - smoother_flux/mpas_mesh%areaCell(cell2)
+               end if
+            end do
+         endif ! localpet == 0
+         call mpi_bcast(field_filtered1d,mpas_mesh%nCells,mpi_real8,0,mpi_comm_world,rc)
+         field1d(:) =  field_filtered1d(:) ! rename, field1d is esmf_kind_r8, which is needed
+
+         ! now update the field
+         call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
+         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
+            call error_handler("IN FieldGet", rc)
+         do j = 1, mpas_mesh%nCellsPerPET
+            varptr(j) = field1d(mpas_mesh%elemIDs(j))
+         enddo
+         nullify(varptr)
+
+         deallocate(field1d,field_filtered1d)
+
+      else ! 3d variable
+
+         nz = nVertLevelsPerVariable(i)
+
+        !if (localpet==0) then
+            allocate(field2d(mpas_mesh%nCells,nz)) ! this is the dimension order things are assigned to the ESMF field
+        !else
+        !   allocate(field2d(0,0))
+        !endif
+
+         ! gather onto process 0
+         call ESMF_FieldGather(fields(i), field2d, rootPet=0, rc=rc)
+         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
+            call error_handler("IN FieldGather", rc)
+
+         ! do the smoothing on process 0
+         allocate(field_filtered2d(mpas_mesh%nCells,nz))
+         if ( localpet == 0 ) then
+            field_filtered2d(:,:) =  field2d(:,:)
+            do iEdge=1,mpas_mesh%nEdges
+               cell1 = mpas_mesh%cellsOnEdge(1,iEdge)
+               cell2 = mpas_mesh%cellsOnEdge(2,iEdge)
+               if (cell1 <= mpas_mesh%nCells .or. cell2 <= mpas_mesh%nCells) then
+                  smoother_coefficient = 0.5*smoother_dimensionless_coefficient*(mpas_mesh%areaCell(cell1)+mpas_mesh%areaCell(cell2))
+                  do k = 1,nz
+                     smoother_flux = smoother_coefficient*mpas_mesh%dvEdge(iEdge)*(field2d(cell2,k) - field2d(cell1,k))/mpas_mesh%dcEdge(iEdge)
+                     field_filtered2d(cell1,k) = field_filtered2d(cell1,k) + smoother_flux/mpas_mesh%areaCell(cell1)
+                     field_filtered2d(cell2,k) = field_filtered2d(cell2,k) - smoother_flux/mpas_mesh%areaCell(cell2)
+                  enddo
+               end if
+            end do
+         endif ! localpet == 0
+         call mpi_bcast(field_filtered2d,mpas_mesh%nCells*nz,mpi_real8,0,mpi_comm_world,rc)
+         field2d(:,:) = field_filtered2d(:,:) ! rename, field2d is esmf_kind_r8, which is needed
+
+         ! now update the field
+         call ESMF_FieldGet(fields(i), farrayPtr=varptr2, rc=rc) ! varptr2 is decomposed across all processors
+         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
+            call error_handler("IN FieldGet", rc)
+         do j = 1, mpas_mesh%nCellsPerPET
+            varptr2(j,:) = field2d(mpas_mesh%elemIDs(j),:)
+         enddo
+         nullify(varptr2)
+
+         deallocate(field2d,field_filtered2d)
+
+      endif ! 2d or 3d variable
+
+   enddo ! loop over variables
+
+   ! update the fields in the bundle
+   call ESMF_FieldBundleAddReplace(bundle, fields, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN ESMF_FieldBundleAddReplace", rc)
+
+   deallocate(fields, field_names)
+
+end subroutine apply_smoothing_filter
 
 end module interp

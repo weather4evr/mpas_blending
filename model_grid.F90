@@ -4,12 +4,12 @@ use mpi
 use netcdf
 use esmf
 use ESMF_LogPublicMod
-use utils_mod, only      : error_handler
+use utils_mod, only      : error_handler, sphere_distance, nearest_cell, mark_neighbors_from_source
 use mpas_netcdf_interface, only : open_netcdf, close_netcdf, get_netcdf_dims, &
                                   get_netcdf_var, netcdf_err
 use program_setup, only  : nvars_to_blend, &
                            nlat, nlon, lat_ll, lon_ll, dx_in_degrees, &
-                           is_regional, output_latlon_grid
+                           is_regional, output_latlon_grid, max_boundary_layer_to_keep
 implicit none
 
 private
@@ -24,10 +24,15 @@ integer, public               :: nmeshes
 integer, allocatable, public  :: elemIDs(:) !< IDs of the elements on present PET
 real, allocatable, public     :: lons_output_grid(:,:), lats_output_grid(:,:)
 integer, parameter, public    :: mask_value = -9999
+integer, parameter, public :: INSIDE = 0
+integer, parameter, public :: UNMARKED = -1
+integer, parameter, public :: MARKED = 1
+
 
 ! Public subroutines
 public :: read_grid_info_file
 public :: define_grid_mpas, define_grid_latlon
+public :: find_interior_cell, extract_boundary_cells, find_mesh_boundary
 public :: cleanup
 
 type mpas_mesh_type
@@ -35,14 +40,17 @@ type mpas_mesh_type
    integer :: nCellsPerPET  ! number of cells on this processor
    integer :: cell_start    ! starting cell on this processor
    integer :: cell_end      ! ending cell on this processor
-   integer :: maxEdges      ! maximum number of edges on a cell in the mesh
    integer :: nEdges        ! number of edges on the mesh
+   integer :: maxEdges      ! maximum number of edges on a cell in the mesh
+   logical :: regional_mesh ! is it a regional mesh (true) or a global mesh (false)?
    integer, allocatable  :: elemIDs(:) ! IDs of the elements (cell centers) on this processor
    real    :: mpas_mesh_radius ! meters; radius of earth used in MPAS mesh
    real, allocatable :: latCell(:), lonCell(:), areaCell(:) ! each processor has full field
    integer, allocatable :: nEdgesOnCell(:)  ! each processor has full field
    integer, allocatable :: cellsOnCell(:,:) ! each processor has full field
    integer, allocatable :: bdyMaskCell(:)  ! each processor has full field
+   integer, allocatable :: cellsOnEdge(:,:) ! each processor has full field
+   real, allocatable :: dcEdge(:), dvEdge(:)  ! each processor has full field
 end type
 
 public :: mpas_mesh_type
@@ -135,10 +143,15 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    allocate(mpas_mesh%cellsOnCell(maxEdges,nCells))
    allocate(mpas_mesh%nEdgesOnCell(nCells))
    allocate(mpas_mesh%areaCell(nCells))
+   allocate(mpas_mesh%cellsOnEdge(2,nEdges))
+   allocate(mpas_mesh%dcEdge(nEdges))
+   allocate(mpas_mesh%dvEdge(nEdges))
    call get_netcdf_var(ncid,'cellsOnCell',(/1,1/),(/maxEdges,nCells/),mpas_mesh%cellsOnCell)
    call get_netcdf_var(ncid,'nEdgesOnCell',(/1/),(/nCells/),mpas_mesh%nEdgesOnCell)
    call get_netcdf_var(ncid,'areaCell',(/1/),(/nCells/),mpas_mesh%areaCell)
-
+   call get_netcdf_var(ncid,'cellsOnEdge',(/1,1/),(/2,nEdges/),mpas_mesh%cellsOnEdge)
+   call get_netcdf_var(ncid,'dcEdge',(/1/),(/nEdges/),mpas_mesh%dcEdge)
+   call get_netcdf_var(ncid,'dvEdge',(/1/),(/nEdges/),mpas_mesh%dvEdge)
 
    ! Determine if the mesh is regional. If so, 
    !  fill it and mask out the boundary points.
@@ -150,15 +163,30 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    if ( error == 0 ) then
       if (localpet==0) print*,"- Found bdyMaskCell"
       call get_netcdf_var(ncid,'bdyMaskCell',(/cell_start/),(/nCellsPerPET/),bdyMaskCell)
-      where (bdyMaskCell >= 1 ) bdyMaskCell = mask_value
+      where (bdyMaskCell > max_boundary_layer_to_keep ) bdyMaskCell = mask_value
 
       call get_netcdf_var(ncid,'bdyMaskCell',(/1/),(/nCells/),mpas_mesh%bdyMaskCell)
-      where (mpas_mesh%bdyMaskCell >= 1 ) mpas_mesh%bdyMaskCell = mask_value
+      where (mpas_mesh%bdyMaskCell > max_boundary_layer_to_keep ) mpas_mesh%bdyMaskCell = mask_value
    else
       bdyMaskCell = 0
       mpas_mesh%bdyMaskCell = 0
    endif
 
+   ! Global meshes could have bdyMaskCell, but it will be 0 everywhere.  Figure out if 
+   ! it's a regional mesh
+   if ( all(mpas_mesh%bdyMaskCell == 0 )) then
+      mpas_mesh%regional_mesh = .false.
+   else
+      mpas_mesh%regional_mesh = .true.
+   endif
+   if (localpet == 0) print*,"- Regional mesh is ",mpas_mesh%regional_mesh
+
+   ! If true, we just let ESMF do its thing in the interpolation,
+   !   and it will not interpolate to points that it can't map to
+  !if ( use_esmf_instinctive_masking_for_regional ) then
+  !   bdyMaskCell = 0
+  !   mpas_mesh%bdyMaskCell = 0
+  !endif
 
    ! Close netCDF file--no longer needed
    call close_netcdf(trim(the_file),ncid)
@@ -563,5 +591,128 @@ subroutine para_range(n1, n2, nprocs, irank, ista, iend)
   if (iwork2 > irank) iend = iend + 1
   return
 end subroutine para_range
+
+subroutine find_interior_cell(localpet,mpas_mesh,interior_cell)
+   integer, intent(in)              :: localpet
+   type(mpas_mesh_type), intent(in) :: mpas_mesh
+   integer, intent(inout)           :: interior_cell
+
+   integer :: iCell, i, j, k, jCell
+   logical :: all_inside, all_inside2
+
+   ! Loop over all Cells.  As soon as we find a point where all its neighbors are also in the
+   !  mesh interior, we know that point is in the interior
+   do i = 1,mpas_mesh%nCells
+      if ( mpas_mesh%bdyMaskCell(i) /= 0 ) cycle ! check the current point; if not interior, go to next one
+      all_inside = .true. ! assume all neighbors of the point are interior
+      do j = 1, mpas_mesh%nEdgesOnCell(i)
+         iCell = mpas_mesh%cellsOnCell(j,i)
+         if ( mpas_mesh%bdyMaskCell(iCell) /= 0 ) then
+            all_inside = .false.
+            exit ! no need to check other cells
+         endif
+         do k = 1, mpas_mesh%nEdgesOnCell(iCell) ! check another layer
+            jCell = mpas_mesh%cellsOnCell(k,iCell)
+            if ( mpas_mesh%bdyMaskCell(jCell) /= 0 ) then
+               all_inside = .false.
+               exit
+            endif
+         enddo
+      enddo
+      if ( all_inside ) then ! now check one more ring, just to make extra sure the point is in the interior
+         interior_cell = i
+         exit ! we found an interior cell. exit loop.
+      endif
+   enddo
+
+   if ( localpet == 0 ) then
+      write(*,*)'interior cell = ', interior_cell
+      write(*,*)'interior cell lat/lon = ', mpas_mesh%latCell(interior_cell)*180.0/3.14, &
+                                            mpas_mesh%lonCell(interior_cell)*180.0/3.14
+   endif
+
+   return
+
+end subroutine find_interior_cell
+
+subroutine extract_boundary_cells(mpas_mesh,boundary_cell,nbdyCells,bdyCells)
+   type(mpas_mesh_type), intent(in) :: mpas_mesh
+   integer, intent(in)  :: boundary_cell, nbdyCells
+   integer, intent(inout), dimension(nbdyCells) :: bdyCells
+
+   integer :: i, n
+
+   n = 0
+   do i = 1,mpas_mesh%nCells
+      if (mpas_mesh%bdyMaskCell(i) == boundary_cell ) then
+         n = n + 1
+         bdyCells(n) = i
+      endif
+   enddo
+
+  ! more succinct way of going it to avoid the loop
+  !bdyCells(:) = pack(mpas_mesh%bdyMaskCell, mpas_mesh%bdyMaskCell == boundary_cell)
+
+  ! quick sanity check
+  if ( n /= nbdyCells ) then
+     call error_handler("Wrong number of boundary cells", -250)
+  endif
+
+end subroutine extract_boundary_cells
+
+subroutine find_mesh_boundary(localpet,interior_cell, nbdyCells, bdyCells, mark_neighbors, mesh_source, mesh_target)
+
+   integer, intent(in)                       :: localpet,interior_cell, nbdyCells
+   logical, intent(in)                       :: mark_neighbors
+   integer, dimension(nbdyCells), intent(in) :: bdyCells
+   type(mpas_mesh_type), intent(in)          :: mesh_source
+   type(mpas_mesh_type), intent(inout)       :: mesh_target
+
+   integer :: start_cell, i, iCell, nearest_cell_to_source_point, nc, j, jCell
+   real    :: d
+
+   mesh_target%bdyMaskCell(:) = UNMARKED ! these have been filled in define_grid_mpas...but re-initialize them to UNMARKED
+
+   start_cell = 1
+   do i = 1,nbdyCells
+      iCell = bdyCells(i)
+      nearest_cell_to_source_point = nearest_cell( mesh_source%latCell(iCell), mesh_source%lonCell(iCell), &
+                                                   start_cell, mesh_target%nCells, mesh_target%maxEdges, &
+                                                   mesh_target%nEdgesOnCell, mesh_target%cellsOnCell , &
+                                                   mesh_target%latCell, mesh_target%lonCell)
+      nc = nearest_cell_to_source_point ! shorter variable name
+
+      ! make sure distances bewteen the current and newly-found points are close enough?
+     !d = sphere_distance(mesh_source%latCell(iCell), mesh_source%lonCell(iCell), mesh_target%latCell(nc), &
+      !                                    mesh_target%lonCell(nc), mesh_source%mpas_mesh_radius )
+      ! check the distance between the source lat/lon and target lat/lon
+     !if ( d .gt. latlon_tolerance_threshold ) then
+     !   call error_handler('oops', 175)
+     !endif
+
+      mesh_target%bdyMaskCell(nc) = MARKED ! this is the location of a boundary cell on the target mesh. mark it.
+
+      ! also mark the neighbors 
+      if ( mark_neighbors ) then
+         do j=1, mesh_target%nEdgesOnCell(nc)
+            jCell = mesh_target%cellsOnCell(j, nc)
+            mesh_target%bdyMaskCell(jCell) = MARKED
+         enddo
+      endif
+
+      ! go to the next cell, and make a guess about a good starting cell
+      start_cell = nc
+
+   enddo
+
+   ! we now know where the boundary is on the target mesh (probably the next coarsest mesh in this context)
+   ! starting from the known interior lat/lon, fill in the mesh
+   ! to start, only the boundary is "marked"; everything else is unmarked
+   mesh_target%bdyMaskCell(interior_cell) = MARKED
+   call mark_neighbors_from_source(interior_cell, MARKED, UNMARKED, mesh_target%bdyMaskCell, mesh_target%cellsOnCell, mesh_target%nEdgesOnCell)
+
+   where ( mesh_target%bdyMaskCell == UNMARKED ) mesh_target%bdyMaskCell = mask_value
+
+end subroutine find_mesh_boundary
 
 end module model_grid

@@ -4,20 +4,22 @@ program mpas_blending
 
 use mpi
 use esmf
-use utils_mod, only      : error_handler
+use utils_mod, only      : error_handler, nearest_cell
 
 use program_setup, only  : LogType, read_setup_namelist,  &
                            large_scale_file, small_scale_file, grid_info_file, &
                            average_upscale_before_interp, &
                            output_intermediate_files_up, output_intermediate_files_down, &
                            interp_method, output_latlon_grid, output_blended_filename, &
-                           dx_in_degrees, nvars_to_blend
+                           dx_in_degrees, nvars_to_blend, smooth_going_downscale, smoother_dimensionless_coefficient, &
+                           max_boundary_layer_to_keep
 use model_grid, only     : define_grid_mpas, define_grid_latlon, mpas_mesh_type, mpas_meshes, &
                            nmeshes, meshes, grid_files_heirarchy, read_grid_info_file, weights, &
-                           latlon_grid, cleanup, nominal_horizontal_cell_spacing
+                           latlon_grid, cleanup, nominal_horizontal_cell_spacing, &
+                           find_interior_cell, extract_boundary_cells, find_mesh_boundary, mask_value
 use input_data, only     : read_input_data, &
                            input_data_error_checks, nVertLevelsPerVariable
-use interp, only         : interp_data, radially_average
+use interp, only         : interp_data, radially_average, apply_smoothing_filter
 use bundles_mod, only    : add_subtract_bundles, cleanup_bundles, define_bundle, &
                            large_scale_data_going_up, small_scale_data_going_up, &
                            large_scale_data_going_down, small_scale_data_going_down, &
@@ -27,7 +29,9 @@ use write_data, only     : write_to_file, write_to_file_latlon
 
 implicit none
 
-integer                   :: ierr, localpet, npets, i
+integer                   :: ierr, localpet, npets, i, interior_cell, my_interior_cell
+integer                   :: nbdyCells, cell_start, cell_end
+integer, allocatable      :: bdyCells(:)
 real                      :: w1, w2
 character(len=500)        :: my_output_name
 character(len=5)          :: cell_dx, cell_degrees
@@ -64,7 +68,7 @@ print*,'- LOCAL PET ',localpet
 !--------------------------------
 ! All processors read the namelist
 !--------------------------------
-call read_setup_namelist('input.nml')
+call read_setup_namelist('input.nml',localpet)
 allocate(nVertLevelsPerVariable(nvars_to_blend)) ! try to get rid of this variable somehow....
 
 !--------------------------------------------
@@ -79,6 +83,53 @@ allocate(mpas_meshes(nmeshes)) ! mpas_mesh_type type defined in model_grid
 do i = 1,nmeshes
    call define_grid_mpas(localpet, npets, grid_files_heirarchy(i), meshes(i),mpas_meshes(i)) ! output is meshes(i), mpas_meshes(i)
 enddo
+
+! Do masking if the input mesh is a regional one
+if ( mpas_meshes(1)%regional_mesh ) then
+   call find_interior_cell(localpet, mpas_meshes(1), interior_cell) ! return a global cellID (across whole mesh) we are pretty sure is in the interior
+   nbdyCells = count(mpas_meshes(1)%bdyMaskCell == max_boundary_layer_to_keep)
+   allocate(bdyCells(nbdyCells))
+   if (localpet==0) write(*,fmt='(a26,i5,a3,i5)')' mesh 1 num bdyMaskCell = ', max_boundary_layer_to_keep, ' : ',nbdyCells
+   if (localpet==0) write(*,fmt='(a31,i10)')' num masked cells for mesh    1 = ', count(mpas_meshes(1)%bdyMaskCell == mask_value)
+   call extract_boundary_cells(mpas_meshes(1), max_boundary_layer_to_keep, nbdyCells, bdyCells) ! get the cells on the mesh that make up the boundary
+   do i = 1,nmeshes-1
+      ! find the boundary on each mesh, based on the finest mesh (mpas_meshes(1))
+      ! then fill the region within the boundary, and set area outside of region to mask_value
+
+      ! find the point on the (i+1)th mesh corresponding to an interior_cell on the finest resolution mesh
+      my_interior_cell = nearest_cell( mpas_meshes(1)%latCell(interior_cell), mpas_meshes(1)%lonCell(interior_cell), &
+                                                   1, mpas_meshes(i+1)%nCells, mpas_meshes(i+1)%maxEdges, &
+                                                   mpas_meshes(i+1)%nEdgesOnCell, mpas_meshes(i+1)%cellsOnCell , &
+                                                   mpas_meshes(i+1)%latCell, mpas_meshes(i+1)%lonCell)
+      if (localpet==0) then
+         write(*,fmt='(a32,i4,a3,2f12.4)')'interior point lat/lon for mesh ',(i+1),' = ',mpas_meshes(i+1)%latCell(my_interior_cell)*180.0/3.14, &
+                                                                                         mpas_meshes(i+1)%lonCell(my_interior_cell)*180.0/3.14
+      endif
+
+      ! 5th entry .false. means don't also "mark" neighbors of the boundary
+      call find_mesh_boundary(localpet,my_interior_cell, nbdyCells, bdyCells, .false., mpas_meshes(1), mpas_meshes(i+1)) ! updates mpas_meshes(i+1)%bdyMaskCell (last argument)
+
+      ! it's possible that there could be a hole in the boundary on one of the meshes
+      ! if so, no cells will be masked
+      ! fill in the hole by marking the neighbors of points supposedly on the boundary
+      if ( count(mpas_meshes(i+1)%bdyMaskCell == mask_value) == 0 ) then
+         ! 5th entry .true. means DO "mark" neighbors of the boundary
+         if (localpet==0) write(*,fmt='(a,i4)')' filling a hole for mesh ',(i+1)
+         call find_mesh_boundary(localpet,my_interior_cell, nbdyCells, bdyCells, .true., mpas_meshes(1), mpas_meshes(i+1)) ! updates mpas_meshes(i+1)%bdyMaskCell (last argument)
+      endif
+
+      if (localpet==0) write(*,fmt='(a27,i4,a3,i10)')' num masked cells for mesh ',(i+1),' = ', count(mpas_meshes(i+1)%bdyMaskCell == mask_value)
+     !if (i == nmeshes-1 .and. localpet==0) write(*,*) mpas_meshes(i+1)%bdyMaskCell(:)
+      ! mpas_meshes(i+1)%bdyMaskCell = mask_value at areas outside of the region determined by max_boundary_layer_to_keep
+      ! now update the mask.
+      ! ESMF_MeshSet only works if elementMask was specified when creating the mesh in "define_grid_mpas" (it was!)
+      ! elementMask is per PE, so we need cell_start and cell_end
+      cell_start = mpas_meshes(i+1)%cell_start
+      cell_end = mpas_meshes(i+1)%cell_end
+      call ESMF_MeshSet(meshes(i+1), elementMask=mpas_meshes(i+1)%bdyMaskCell(cell_start:cell_end), rc=ierr)
+   enddo
+   deallocate(bdyCells)
+endif
 
 !---------------------------------------------
 ! Error checking to make sure large_scale_file 
@@ -251,12 +302,16 @@ do i = nmeshes, 2, -1
    w1 = real(weights(i)) ! weights to data providing large-scale data
    w2 = real(1.0 - w1)
    call interp_data(localpet,blending_bundle(i),blending_bundle(i-1),interp_method) !'bilinear')
+   if ( smooth_going_downscale ) then
+      call apply_smoothing_filter(localpet,mpas_meshes(i-1),smoother_dimensionless_coefficient,blending_bundle(i-1))
+   endif
 
    tmp_bundle(i-1) = add_subtract_bundles(localpet, 'add', &
                        large_scale_data_perts(i-1),small_scale_data_perts(i-1), w1, w2)
 
    blending_bundle(i-1) = add_subtract_bundles(localpet, 'add', &
                     blending_bundle(i-1),tmp_bundle(i-1), 1.0, 1.0)
+
 enddo
 
 !-----------------------------------------
@@ -304,6 +359,9 @@ do i = 1,nmeshes
    deallocate(mpas_meshes(i)%cellsOnCell)
    deallocate(mpas_meshes(i)%areaCell)
    deallocate(mpas_meshes(i)%bdyMaskCell)
+   deallocate(mpas_meshes(i)%cellsOnEdge)
+   deallocate(mpas_meshes(i)%dvEdge)
+   deallocate(mpas_meshes(i)%dcEdge)
 enddo
 
 do i = 1,nmeshes-1
