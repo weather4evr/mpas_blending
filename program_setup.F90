@@ -19,7 +19,7 @@ integer, public :: nvars_to_blend
 ! Public namelist &share variables
 character(len=500), public  :: large_scale_file = "NULL" ! Full path of MPAS file with large-scale information
 character(len=500), public  :: small_scale_file = "NULL" ! Full path of MPAS file with small-scale information
-character(len=500), public  :: output_blended_filename = "NULL" ! Full path of output file to be created with blended fields
+character(len=500), public  :: output_blended_filename = "./blended.nc" ! Full path of output file to be created with blended fields
 character(len=500), public  :: grid_info_file      = "NULL"   ! Full path of text file with information about meshes
 character(len=500), public  :: interp_method = "bilinear" ! Interpolation method
 character(len=500), public  :: variables_to_blend(nvars_max) = "NULL" ! netCDF variable names to blend
@@ -31,7 +31,7 @@ logical, public             :: esmf_log = .false. ! logging information
 logical, public             :: smooth_going_downscale = .false. ! If true, run a smoother after interpolating downscale when reconstructing fields
 real,    public             :: smoother_dimensionless_coefficient = 0.0 ! Not used if smooth_going_downscale = .false.; parameter for smoothing
 integer, public             :: max_boundary_layer_to_keep = 7 ! The largest boundary cell (bdyMaskCell) for which we'll use in the interpolation
-
+character(len=50), public   :: regional_masking_method = "none" ! If "none" don't do anything special. If "esmf", let ESMF figure out the points it can't interpolate to for regional meshes. If "mpas_bdy", use MPAS mesh geometry to try and do regional masking.
 
 ! Public namelist &latlon_output variables
 logical, public            :: output_latlon_grid = .false. ! Switch to turn on lat-lon output (for diagnostics purposes)
@@ -51,7 +51,7 @@ namelist /share/ large_scale_file, small_scale_file, output_blended_filename, &
          average_upscale_before_interp, output_intermediate_files_up, &
          output_intermediate_files_down, output_blended_edge_normal_wind, esmf_log, &
          smooth_going_downscale, smoother_dimensionless_coefficient, &
-         max_boundary_layer_to_keep
+         max_boundary_layer_to_keep, regional_masking_method
 
 namelist /latlon_output/ output_latlon_grid, is_regional, &
                          nlat, nlon, lat_ll, lon_ll, dx_in_degrees
@@ -91,14 +91,25 @@ subroutine read_setup_namelist(filename,localpet)
    endif 
 
    ! Check bounds on max_boundary_layer_to_keep
-   if ( max_boundary_layer_to_keep > 7 ) then
-      if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 7'
-      max_boundary_layer_to_keep = 7
-   endif
+  !if ( max_boundary_layer_to_keep > 7 ) then
+  !   if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 7'
+  !   max_boundary_layer_to_keep = 7
+  !endif
 
-   if ( max_boundary_layer_to_keep < 1 ) then
-      if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 1'
-      max_boundary_layer_to_keep = 1
+  !if ( max_boundary_layer_to_keep < 1 ) then
+  !   if (localpet==0) write(*,*) 'Resetting max_boundary_layer_to_keep = 1'
+  !   max_boundary_layer_to_keep = 1
+  !endif
+
+   if ( trim(adjustl(regional_masking_method)) == "esmf" ) then
+      if (localpet==0) write(*,*)'using ESMF routines to try regional masking'
+   else if ( trim(adjustl(regional_masking_method)) == "mpas_bdy" ) then
+      if (localpet==0) write(*,*)'using MPAS routines to try regional masking'
+   else if ( trim(adjustl(regional_masking_method)) == "none" ) then
+      if (localpet==0) write(*,*)'no attempt at regional masking'
+   else
+      if (localpet==0) write(*,*)'regional_masking_method = '//trim(adjustl(regional_masking_method))//' is invalid. exit'
+      call error_handler("INVALID REGIONAL_MASKING_METHOD", ierr)
    endif
  
 end subroutine read_setup_namelist

@@ -17,10 +17,12 @@ public :: get_netcdf_var
 
 interface get_netcdf_var
    module procedure get_netcdf_var_1d_integer
+!  module procedure get_netcdf_var_1d_integer_esmf_kind
    module procedure get_netcdf_var_1d_real
    module procedure get_netcdf_var_1d_real_esmf_kind
-   module procedure get_netcdf_var_2d_real
    module procedure get_netcdf_var_2d_integer
+   module procedure get_netcdf_var_2d_real
+   module procedure get_netcdf_var_2d_real_esmf_kind
 end interface
 
 ! variables visible to this module only
@@ -80,6 +82,22 @@ subroutine get_netcdf_var_1d_integer(fileid,variable,start_index,num_points,outp
    call netcdf_err(error,'Error nf90_get_var '//trim(adjustl(variable)) )
 
 end subroutine get_netcdf_var_1d_integer
+
+subroutine get_netcdf_var_1d_integer_esmf_kind(fileid,variable,start_index,num_points,output)
+
+   integer, intent(in)          :: fileid
+   character(len=*), intent(in) :: variable
+   integer, intent(in)          :: start_index(1),num_points(1) ! these are arrays (e.g., (/cell_start/), (/nCells/))
+   integer(ESMF_KIND_I4), intent(inout), dimension(num_points(1))  :: output
+
+   integer :: ncvarid
+
+   error = nf90_inq_varid(fileid,trim(adjustl(variable)),ncvarid)
+   call netcdf_err(error,'Error nf90_inq_varid '//trim(adjustl(variable)) )
+   error = nf90_get_var(fileid,ncvarid,start=start_index, count=num_points, values=output)
+   call netcdf_err(error,'Error nf90_get_var '//trim(adjustl(variable)) )
+
+end subroutine get_netcdf_var_1d_integer_esmf_kind
 
 subroutine get_netcdf_var_1d_real(fileid,variable,start_index,num_points,output)
 
@@ -145,7 +163,21 @@ subroutine get_netcdf_var_2d_real(fileid,variable,start_index,num_points,output)
 
 end subroutine get_netcdf_var_2d_real
 
+subroutine get_netcdf_var_2d_real_esmf_kind(fileid,variable,start_index,num_points,output)
 
+   integer, intent(in)          :: fileid
+   character(len=*), intent(in) :: variable
+   integer, intent(in)          :: start_index(2),num_points(2) ! these are arrays (e.g., (/cell_start/), (/nCells/))
+   real(esmf_kind_r8), intent(inout), dimension(num_points(1),num_points(2))  :: output
+
+   integer :: ncvarid
+
+   error = nf90_inq_varid(fileid,trim(adjustl(variable)),ncvarid)
+   call netcdf_err(error,'Error nf90_inq_varid '//trim(adjustl(variable)) )
+   error = nf90_get_var(fileid,ncvarid,start=start_index, count=num_points, values=output)
+   call netcdf_err(error,'Error nf90_get_var '//trim(adjustl(variable)) )
+
+end subroutine get_netcdf_var_2d_real_esmf_kind
 !! Error handler for netcdf
 !! @param[in] err     error status code
 !! @param[in] string  error message

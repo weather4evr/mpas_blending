@@ -2,7 +2,7 @@ module input_data
 
 use esmf
 use netcdf
-use mpas_netcdf_interface, only : open_netcdf, close_netcdf, get_netcdf_dims, netcdf_err
+use mpas_netcdf_interface, only : open_netcdf, close_netcdf, get_netcdf_dims, netcdf_err, get_netcdf_var
 use utils_mod, only      : error_handler
 use program_setup, only  : nvars_to_blend, variables_to_blend
 use model_grid, only     : mpas_mesh_type
@@ -18,50 +18,26 @@ integer, public              :: nzp1_input = -1  ! number of input grid atm laye
 integer, public              :: nsoil_input = -1 ! number of input soil levels
 
 ! Public subroutines
-public :: read_input_data, input_data_error_checks
+public :: read_input_data, input_data_error_checks, set_nVertLevelsPerVariable
 
 contains
 
-subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
-
-   include 'mpif.h'
+subroutine set_nVertLevelsPerVariable(localpet,the_file)
 
    integer, intent(in)                   :: localpet
-   type(esmf_mesh), intent(in)           :: input_mesh
-   type(mpas_mesh_type), intent(in)      :: mpas_mesh
    character(len=500), intent(in)        :: the_file
-   type(esmf_fieldbundle), intent(inout) :: bundle
 
-   character(len=50)               :: vname
-   integer                         :: error, ncid, rc
-   integer                         :: id_var, i, j, k
-   integer                         :: lowBound, upperBound, nz
-   integer                         :: xtype, ndims_var, natts, dimids(NF90_MAX_VAR_DIMS), dims(4)
-   character(len=500)              :: varname
-   character(len=NF90_MAX_NAME)    :: dim_names(4)
-   integer, allocatable            :: elemIDs(:) !, nodeIDs
-   integer                         :: nCells_input, nCellsPerPET
-
-   type(esmf_field),allocatable    :: fields(:)
-    
-   real(esmf_kind_r8), allocatable :: dummy2(:,:), dummy3(:,:,:)
-   real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
+   character(len=50)            :: vname
+   integer                      :: error, ncid, rc
+   integer                      :: id_var, i, j, k, nz
+   integer                      :: xtype, ndims_var, natts, dimids(NF90_MAX_VAR_DIMS), dims(4)
+   character(len=500)           :: varname
+   character(len=NF90_MAX_NAME) :: dim_names(4)
 
    ! open the netCDF file with the data we want to read
    call open_netcdf(trim(the_file),ncid)
 
    if (localpet==0) print*, "GETTING INPUT DATA FROM", trim(adjustl(the_file))
-
-   nCells_input = mpas_mesh%nCells
-   nCellsPerPET = mpas_mesh%nCellsPerPET
-   allocate(elemIDs(nCellsPerPET))
-   elemIDs = mpas_mesh%elemIDs
-
-   !-------------------------------------
-   ! Initialize esmf atmospheric fields 
-   !-------------------------------------
-
-   allocate(fields(nvars_to_blend))
 
    do i = 1,nvars_to_blend
        
@@ -75,7 +51,7 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
       dims(:) = 1
       dim_names(:) = ''
       error = nf90_Inquire_Variable(ncid, id_var, varname, xtype, ndims_var, dimids, natts) ! Output is varname, xtype,ndims_var, dimids
-      call netcdf_err(error, 'inquiring variable' )
+      call netcdf_err(error, 'inquiring variable')
       do j = 1,ndims_var
          error = nf90_inquire_dimension( ncid, dimids(j), name=dim_names(j), len=dims(j) )
          dim_names(j) = trim(adjustl(dim_names(j))) ! can't do trim on an array, so do it here
@@ -90,60 +66,88 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
 
       if ( any(dim_names.eq."nVertLevels")) then
          call get_netcdf_dims(ncid,'nVertLevels',nz_input) ! define public variable
-         upperBound = nz_input
+         nz = nz_input
       else if ( any(dim_names.eq."nSoilLevels")) then
          call get_netcdf_dims(ncid,'nSoilLevels',nsoil_input) ! define public variable
-         upperBound = nsoil_input
+         nz = nsoil_input
       else if ( any(dim_names.eq."nVertLevelsP1")) then
          call get_netcdf_dims(ncid,'nVertLevelsP1',nzp1_input) ! define public variable
-         upperBound = nzp1_input
+         nz = nzp1_input
       else ! 2D variable
-         upperBound = 1
+         nz = 1
       endif
 
-      lowBound = 1 
-      nz = upperBound
       nVertLevelsPerVariable(i) = nz ! public from this module, allocated in mpas_blending.f90
+
+   end do
+
+   call close_netcdf(trim(the_file),ncid)
+
+end subroutine set_nVertLevelsPerVariable
+
+subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
+   integer, intent(in)                   :: localpet
+   type(esmf_mesh), intent(in)           :: input_mesh
+   type(mpas_mesh_type), intent(in)      :: mpas_mesh
+   character(len=500), intent(in)        :: the_file
+   type(esmf_fieldbundle), intent(inout) :: bundle
+
+   character(len=50)               :: vname
+   integer                         :: nCells_input, nCellsPerPET
+   integer                         :: lowBound, nz, i, j
+   integer                         :: error, rc, ncid
+   type(esmf_field),allocatable    :: fields(:)
+   real(esmf_kind_r8), allocatable :: dummy2(:,:), dummy3(:,:,:)
+   real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
+
+  !include 'mpif.h'
+
+   nCells_input = mpas_mesh%nCells
+   nCellsPerPET = mpas_mesh%nCellsPerPET
+
+   allocate(fields(nvars_to_blend))
+   call ESMF_FieldBundleGet(bundle, fieldList=fields, &
+                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet", rc)
+
+   !-------------------------------------
+   ! Get the data from the input file
+   !-------------------------------------
+
+   ! open the netCDF file with the data we want to read
+   call open_netcdf(trim(the_file),ncid)
+
+   do i = 1,nvars_to_blend
+
+      vname = trim(adjustl(variables_to_blend(i)))
 
       if (localpet==0) print*, "- INIT FIELD ", vname
 
-      if ( nVertLevelsPerVariable(i).eq.1 ) then
-         fields(i) = ESMF_FieldCreate(input_mesh, & 
-                         typekind=ESMF_TYPEKIND_R8, &
-                         meshloc=ESMF_MESHLOC_ELEMENT, &
-                         name=variables_to_blend(i), rc=rc)
-         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
-             call error_handler("IN FieldCreate", rc)
+      lowBound = 1
+      nz = nVertLevelsPerVariable(i)
+
+      if ( nz.eq.1 ) then
 
          allocate(dummy2(nCells_input,1))
          call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc)
          if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
             call error_handler("IN FieldGet", rc)
-         error=nf90_get_var(ncid, id_var, dummy2) ! use direct nf90 routine b/c we already have id_var
-         call netcdf_err(error, 'reading field' )
+         call get_netcdf_var(ncid,trim(vname),(/1/),(/nCells_input/),dummy2(:,1))
          do j = 1, nCellsPerPET
-            varptr(j) = dummy2(elemIDs(j),1)
+            varptr(j) = dummy2(mpas_mesh%elemIDs(j),1)
          enddo
          nullify(varptr)
          deallocate(dummy2)
       else
-         fields(i) = ESMF_FieldCreate(input_mesh, & 
-                         typekind=ESMF_TYPEKIND_R8, &
-                         meshloc=ESMF_MESHLOC_ELEMENT, &
-                         name=variables_to_blend(i), &
-                         ungriddedLBound=(/lowBound/), &
-                         ungriddedUBound=(/upperBound/), rc=rc)
-         if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
-             call error_handler("IN FieldCreate", rc)
 
          allocate(dummy3(nz,nCells_input,1))
          call ESMF_FieldGet(fields(i), farrayPtr=varptr2, rc=rc)
          if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
             call error_handler("IN FieldGet", rc)
-         error=nf90_get_var(ncid, id_var, dummy3) ! use direct nf90 routine b/c we already have id_var
-         call netcdf_err(error, 'reading field' )
+         call get_netcdf_var(ncid,trim(vname),(/1,1/),(/nz,nCells_input/),dummy3(:,:,1))
          do j = 1, nCellsPerPET
-            varptr2(j,:) = dummy3(:,elemIDs(j),1)
+            varptr2(j,:) = dummy3(:,mpas_mesh%elemIDs(j),1)
          enddo
          nullify(varptr2)
          deallocate(dummy3)
@@ -153,12 +157,12 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
 
    enddo ! end loop over number of variables
 
-   ! create bundle now that we've defined all the fields
-   bundle = ESMF_FieldBundleCreate(fieldList=fields, name="input bundle", rc=rc)
-   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
-      call error_handler("IN FieldBundleCreate", rc)
+   ! update the fields in target_bundle
+   call ESMF_FieldBundleAddReplace(bundle, fields, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN ESMF_FieldBundleAddReplace", rc)
 
-   deallocate(fields, elemIDs)
+   deallocate(fields)
 
    call close_netcdf(trim(the_file),ncid)
 

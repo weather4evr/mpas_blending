@@ -9,7 +9,8 @@ use mpas_netcdf_interface, only : open_netcdf, close_netcdf, get_netcdf_dims, &
                                   get_netcdf_var, netcdf_err
 use program_setup, only  : nvars_to_blend, &
                            nlat, nlon, lat_ll, lon_ll, dx_in_degrees, &
-                           is_regional, output_latlon_grid, max_boundary_layer_to_keep
+                           is_regional, output_latlon_grid, max_boundary_layer_to_keep, &
+                           regional_masking_method
 implicit none
 
 private
@@ -20,20 +21,19 @@ real, allocatable, public              :: nominal_horizontal_cell_spacing(:) ! k
 real, allocatable, public              :: weights(:) ! weight to give to model providing large-scale data
 type(esmf_mesh),  allocatable, public  :: meshes(:) ! esmf_mesh that will hold the heirarchy of MPAS meshes
 type(esmf_grid),  public               :: latlon_grid ! used if interpolating to lat-lon grid
-integer, public               :: nmeshes
-integer, allocatable, public  :: elemIDs(:) !< IDs of the elements on present PET
+integer, public                        :: nmeshes ! number of meshes in the heirarchy
 real, allocatable, public     :: lons_output_grid(:,:), lats_output_grid(:,:)
-integer, parameter, public    :: mask_value = -9999
+integer(ESMF_KIND_I4), parameter, public    :: mask_value = -999999999 ! value to masked-out points we don't want to participate in inerpolatoin
+integer(ESMF_KIND_I4), parameter, public    :: ignore_value = -999   ! if data are less than this, a masked out point influenced it.
 integer, parameter, public :: INSIDE = 0
 integer, parameter, public :: UNMARKED = -1
 integer, parameter, public :: MARKED = 1
 
-
 ! Public subroutines
 public :: read_grid_info_file
-public :: define_grid_mpas, define_grid_latlon
+public :: define_grid_mpas, define_grid_latlon !, update_mesh_mask
 public :: find_interior_cell, extract_boundary_cells, find_mesh_boundary
-public :: cleanup
+public :: cleanup, cleanup_mpas_mesh_type
 
 type mpas_mesh_type
    integer :: nCells        ! number of cells on the mesh
@@ -63,23 +63,26 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    integer, intent(in)            :: localpet, npets
    character(len=500), intent(in) :: the_file
    type(esmf_mesh), intent(inout) :: grid_mesh ! esmf_mesh that is output
-   type(mpas_mesh_type), intent(inout) :: mpas_mesh
+   type(mpas_mesh_type), intent(inout) :: mpas_mesh ! mpas_mesh_type that is output
 
    integer                      :: error, i, j, k, n
    integer                      :: ncid,id_var, id_dim, nVertThis
    integer                      :: nCells, nVertices, maxEdges, nEdges
    integer                      :: cell_start, cell_end, temp(1)
    integer                      :: nCellsPerPET ! Number of cells on this PET
+   integer                      :: actual_maxEdges
+   integer, allocatable         :: elemIDs(:) !< IDs of the elements on present PET
+   integer, allocatable         :: bdyMaskCell(:) ! length nCellsPerPET
    integer, allocatable         :: elemTypes2(:), vertOnCell(:,:), &
                                             nodesPET(:), nodeIDs(:), nodeIDs_temp(:), &
                                             elementConn_temp(:), elementConn(:)
-   integer, allocatable             :: bdyMaskCell(:)
    real(esmf_kind_r8), allocatable  :: latCell(:), lonCell(:), &
                                        latVert(:), lonVert(:), &
                                        nodeCoords(:), &
                                        nodeCoords_temp(:), &
                                        elemCoords(:)
    real(esmf_kind_r8), parameter    :: PI=4.D0*DATAN(1.D0)
+   logical :: elementMaskIsPresent
 
    if (localpet==0) print*,'- OPEN MPAS INPUT FILE: ',trim(the_file)
    call open_netcdf(trim(the_file),ncid)
@@ -89,6 +92,8 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    call get_netcdf_dims(ncid,'nVertices',nVertices)
    call get_netcdf_dims(ncid,'maxEdges',maxEdges)
    call get_netcdf_dims(ncid,'nEdges',nEdges)
+   if (localpet==0) print*,"- NUMBER OF CELLS ON INPUT GRID ", nCells
+   if (localpet==0) print*,"- NUMBER OF NODES ON INPUT GRID ", nVertices
 
    ! original algorithm from Larissa, which can lead to
    !  nCellsPerPET < 0 for some meshes,
@@ -98,7 +103,7 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
 !  cell_end = min(localpet*nCellsPerPET+nCellsPerPET,nCells)
 !  nCellsPerPET = cell_end - cell_start + 1
 
-   ! Number of MPAS cells per processor, and starting/ending cells.
+   ! Get number of MPAS cells per processor, and starting/ending cells.
    call para_range(1, nCells, npets, localpet, cell_start, cell_end)
    nCellsPerPET = cell_end - cell_start + 1
 
@@ -134,9 +139,6 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    call get_netcdf_var(ncid,'lonVertex',(/1/),(/nVertices/),lonVert)
    call get_netcdf_var(ncid,'latVertex',(/1/),(/nVertices/),latVert)
 
-   if (localpet==0) print*,"- NUMBER OF CELLS ON INPUT GRID ", nCells
-   if (localpet==0) print*,"- NUMBER OF NODES ON INPUT GRID ", nVertices
-
   !error=nf90_get_var(ncid, id_var, start=(/1,cell_start/),count=(/maxEdges,nCellsPerPET/),values=vertOnCell)
    call get_netcdf_var(ncid,'verticesOnCell',(/1,cell_start/),(/maxEdges,nCellsPerPET/),vertOnCell)
 
@@ -153,10 +155,19 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    call get_netcdf_var(ncid,'dcEdge',(/1/),(/nEdges/),mpas_mesh%dcEdge)
    call get_netcdf_var(ncid,'dvEdge',(/1/),(/nEdges/),mpas_mesh%dvEdge)
 
-   ! Determine if the mesh is regional. If so, 
-   !  fill it and mask out the boundary points.
-   !  Use get variable ID--use direct nf90 call here because we just want the id
-   ! Want to get the field both for this processor only, and the full field to all processors
+   actual_maxEdges = maxval(mpas_mesh%nEdgesOnCell)
+   if ( localpet == 0 .and. (actual_maxEdges > maxEdges) ) then
+      write(*,*)'Actual maxEdges = ',actual_maxEdges
+   endif
+
+   ! Determine if the mesh is regional. If so, fill it and mask out the boundary points.
+   !  Use direct nf90 call here because we just want the error code.
+   ! Want to get the field both for this processor only, and the full field on all processors
+   ! The field bdyMaskCell is used to set elementMask during ESMF mesh generation.
+   !  the field for the 1st MPAS mesh is indeed set during this call.  However, elementMask
+   !  will later be updated for the 2nd...Nth meshes later on in the code, but in order to
+   !  update elementMask, it must be set here.
+   !    NOTE--elementMask no longer used--doesn't seem to work
    allocate(bdyMaskCell(nCellsPerPET)) ! integer
    allocate(mpas_mesh%bdyMaskCell(nCells)) ! integer
    error=nf90_inq_varid(ncid, 'bdyMaskCell',id_var)
@@ -181,12 +192,15 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    endif
    if (localpet == 0) print*,"- Regional mesh is ",mpas_mesh%regional_mesh
 
-   ! If true, we just let ESMF do its thing in the interpolation,
+   ! If using ESMF masking, let it do its thing its thing in the interpolation,
    !   and it will not interpolate to points that it can't map to
-  !if ( use_esmf_instinctive_masking_for_regional ) then
-  !   bdyMaskCell = 0
-  !   mpas_mesh%bdyMaskCell = 0
-  !endif
+   if ( mpas_mesh%regional_mesh ) then
+      if ( trim(adjustl(regional_masking_method)) == "esmf"  .or. &
+           trim(adjustl(regional_masking_method)) == "none" ) then
+         bdyMaskCell = 0
+         mpas_mesh%bdyMaskCell = 0
+      endif
+   endif
 
    ! Close netCDF file--no longer needed
    call close_netcdf(trim(the_file),ncid)
@@ -216,6 +230,8 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
        endif
        elemCoords(2*j) = latCell(i)*180.0_esmf_kind_r8/PI
        do n = 1,maxEdges
+           if ( n > actual_maxEdges ) cycle ! probably can remove this line
+           if ( n > mpas_mesh%nEdgesOnCell(i) ) cycle 
            if (vertOnCell(n,i)>0) then
                nVertThis = nVertThis + 1
 
@@ -262,8 +278,9 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
                        elementConn = elementConn, &
                        elementCoords=elemCoords, &
                        coordSys=ESMF_COORDSYS_SPH_DEG, &
-                       elementMask=bdyMaskCell, &
                        rc=error)
+                      !elementMask=bdyMaskCell, &
+
    if(ESMF_logFoundError(rcToCheck=error,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
       call error_handler("IN MeshCreate", error)
 
@@ -282,16 +299,41 @@ subroutine define_grid_mpas(localpet,npets,the_file,grid_mesh,mpas_mesh)
    deallocate(nodeIDs) ! this isn't used later so we can deallocate
    deallocate(bdyMaskCell)
 
+   call ESMF_MeshGet(grid_mesh,elementMaskIsPresent=elementMaskIsPresent,rc=error)
+   if(ESMF_logFoundError(rcToCheck=error,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
+      call error_handler("IN ESMF_MeshGet for elementMaskIsPresent", error)
+
    if (localpet==0) then 
       write(*,*)'Done with define_grid_mpas for '//trim(adjustl(the_file))
+      write(*,*)'elementMaskIsPresent = ',elementMaskIsPresent
       write(*,*)''
    endif
 
 end subroutine define_grid_mpas
 
+!subroutine update_mesh_mask(mesh, mpas_mesh)
+!   type(esmf_mesh), intent(inout) :: mesh
+!   type(mpas_mesh_type), intent(in) :: mpas_mesh
+!   integer :: cell_start, cell_end, ierr
+!
+!  !real(ESMF_KIND_R8), dimension(mpas_mesh%nCellsPerPET) :: elementArea
+!
+!   ! ESMF_MeshSet only works if elementMask was specified when creating the mesh in
+!   !   "define_grid_mpas" (it was!)
+!   ! elementMask is per PE, so we need cell_start and cell_end
+!   cell_start = mpas_mesh%cell_start
+!   cell_end = mpas_mesh%cell_end
+!   call ESMF_MeshSet(mesh, elementMask=mpas_mesh%bdyMaskCell(cell_start:cell_end), rc=ierr)
+!  !call ESMF_MeshGet(mesh,elementArea=elementArea, rc=ierr)
+!  !call ESMF_MeshSet(mesh, elementMask=mpas_mesh%bdyMaskCell(cell_start:cell_end),elementArea=elementArea, rc=ierr)
+!   if(ESMF_logFoundError(rcToCheck=ierr,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
+!      call error_handler("IN ESMF_MeshSet", ierr)
+!
+!end subroutine update_mesh_mask
+
 subroutine define_grid_latlon(localpet,npets)
 
-   integer, intent(in)          :: localpet, npets
+   integer, intent(in)              :: localpet, npets
 
    character(len=500)           :: the_file
 
@@ -399,6 +441,7 @@ subroutine define_grid_latlon(localpet,npets)
      do i = clb(1), cub(1)
        lon_src_ptr(i,j)=real(templon(i),esmf_kind_r8)
        if (lon_src_ptr(i,j) > 360.0_esmf_kind_r8) lon_src_ptr(i,j) = lon_src_ptr(i,j) - 360.0_esmf_kind_r8
+       if (lon_src_ptr(i,j) <   0.0_esmf_kind_r8) lon_src_ptr(i,j) = lon_src_ptr(i,j) + 360.0_esmf_kind_r8
        lat_src_ptr(i,j)=real(templat(j),esmf_kind_r8)
      enddo
    enddo
@@ -412,6 +455,7 @@ subroutine define_grid_latlon(localpet,npets)
          do i = 1,nlon
             lons_output_grid(i,j) = templon(i)
             if ( lons_output_grid(i,j) > 360.0 ) lons_output_grid(i,j) = lons_output_grid(i,j) - 360.0
+            if ( lons_output_grid(i,j) <   0.0 ) lons_output_grid(i,j) = lons_output_grid(i,j) + 360.0
             lats_output_grid(i,j) = templat(j)
          enddo
       enddo
@@ -598,7 +642,7 @@ subroutine find_interior_cell(localpet,mpas_mesh,interior_cell)
    integer, intent(inout)           :: interior_cell
 
    integer :: iCell, i, j, k, jCell
-   logical :: all_inside, all_inside2
+   logical :: all_inside
 
    ! Loop over all Cells.  As soon as we find a point where all its neighbors are also in the
    !  mesh interior, we know that point is in the interior
@@ -619,7 +663,7 @@ subroutine find_interior_cell(localpet,mpas_mesh,interior_cell)
             endif
          enddo
       enddo
-      if ( all_inside ) then ! now check one more ring, just to make extra sure the point is in the interior
+      if ( all_inside ) then
          interior_cell = i
          exit ! we found an interior cell. exit loop.
       endif
@@ -663,13 +707,15 @@ end subroutine extract_boundary_cells
 subroutine find_mesh_boundary(localpet,interior_cell, nbdyCells, bdyCells, mark_neighbors, mesh_source, mesh_target)
 
    integer, intent(in)                       :: localpet,interior_cell, nbdyCells
-   logical, intent(in)                       :: mark_neighbors
+   logical, intent(in)                       :: mark_neighbors !fill_holes ! mark_neighbors
    integer, dimension(nbdyCells), intent(in) :: bdyCells
    type(mpas_mesh_type), intent(in)          :: mesh_source
    type(mpas_mesh_type), intent(inout)       :: mesh_target
 
-   integer :: start_cell, i, iCell, nearest_cell_to_source_point, nc, j, jCell
+   integer :: start_cell, i, iCell, nearest_cell_to_source_point, nc, j, jCell, x
    real    :: d
+   integer, dimension(nbdyCells) :: nearest_cells, unique_cells
+   integer, dimension(nbdyCells*mesh_target%maxEdges) :: indices
 
    mesh_target%bdyMaskCell(:) = UNMARKED ! these have been filled in define_grid_mpas...but re-initialize them to UNMARKED
 
@@ -681,6 +727,7 @@ subroutine find_mesh_boundary(localpet,interior_cell, nbdyCells, bdyCells, mark_
                                                    mesh_target%nEdgesOnCell, mesh_target%cellsOnCell , &
                                                    mesh_target%latCell, mesh_target%lonCell)
       nc = nearest_cell_to_source_point ! shorter variable name
+      nearest_cells(i) = nc
 
       ! make sure distances bewteen the current and newly-found points are close enough?
      !d = sphere_distance(mesh_source%latCell(iCell), mesh_source%lonCell(iCell), mesh_target%latCell(nc), &
@@ -705,6 +752,33 @@ subroutine find_mesh_boundary(localpet,interior_cell, nbdyCells, bdyCells, mark_
 
    enddo
 
+   ! fill holes?
+   ! start from all marked cells.
+   ! for each marked cell, look to see if the neighbors are unmarked
+   ! if the same unmarked cell shows up twice, it's probably a hole, so mark it.
+  !if ( fill_holes ) then
+   if ( 1 == 2 ) then
+      unique_cells(:) = -9999
+      indices(:) = -9999
+      x = 0
+      do i = 1,nbdyCells
+         iCell = nearest_cells(i)
+         if ( any(unique_cells == iCell )) cycle ! don't process the same cell more than once
+         unique_cells(i) = iCell
+         do j=1, mesh_target%nEdgesOnCell(iCell)
+            jCell = mesh_target%cellsOnCell(j, iCell)
+            if ( mesh_target%bdyMaskCell(jCell) == UNMARKED ) then
+               x = x + 1
+               if ( any(indices == jCell)) then ! if true, two cells found the same unmarked neighboring cell. mark it.
+                  mesh_target%bdyMaskCell(jCell) = MARKED
+                  if (localpet == 0)write(*,*)'marked ',jCell
+               endif
+               indices(x) = jCell
+            endif
+         enddo
+      enddo
+   endif
+
    ! we now know where the boundary is on the target mesh (probably the next coarsest mesh in this context)
    ! starting from the known interior lat/lon, fill in the mesh
    ! to start, only the boundary is "marked"; everything else is unmarked
@@ -714,5 +788,19 @@ subroutine find_mesh_boundary(localpet,interior_cell, nbdyCells, bdyCells, mark_
    where ( mesh_target%bdyMaskCell == UNMARKED ) mesh_target%bdyMaskCell = mask_value
 
 end subroutine find_mesh_boundary
+
+subroutine cleanup_mpas_mesh_type(mpas_mesh)
+   type(mpas_mesh_type), intent(inout) :: mpas_mesh
+   deallocate(mpas_mesh%ElemIDs)
+   deallocate(mpas_mesh%latCell)
+   deallocate(mpas_mesh%lonCell)
+   deallocate(mpas_mesh%areaCell)
+   deallocate(mpas_mesh%nEdgesOnCell)
+   deallocate(mpas_mesh%cellsOnCell)
+   deallocate(mpas_mesh%bdyMaskCell)
+   deallocate(mpas_mesh%cellsOnEdge)
+   deallocate(mpas_mesh%dvEdge)
+   deallocate(mpas_mesh%dcEdge)
+end subroutine cleanup_mpas_mesh_type
 
 end module model_grid

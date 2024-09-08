@@ -11,7 +11,8 @@ implicit none
 private
  
 ! Public subroutines
-public :: add_subtract_bundles, cleanup_bundles, define_bundle
+public :: add_subtract_bundles, cleanup_bundle, define_bundle
+public :: bundle_get_num_fields, bundle_get_fields, bundle_get_field_names
 
 interface define_bundle
    module procedure define_bundle_mesh
@@ -27,6 +28,11 @@ type(esmf_fieldbundle), allocatable, public :: large_scale_data_perts(:)
 type(esmf_fieldbundle), allocatable, public :: small_scale_data_perts(:)
 type(esmf_fieldbundle), allocatable, public :: latlon_bundle(:)
 type(esmf_fieldbundle), allocatable, public :: blending_bundle(:)
+type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_up_avg(:)
+type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_up_avg(:)
+
+type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_up_nn(:)
+type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_up_nn(:)
 
 contains
 
@@ -48,14 +54,14 @@ subroutine define_bundle_mesh(localpet,the_mesh,bundle)
          fields(i) = ESMF_FieldCreate(the_mesh, &
                      typekind=ESMF_TYPEKIND_R8, &
                      meshloc=ESMF_MESHLOC_ELEMENT, &
-                     name=variables_to_blend(i), rc=rc)
+                     name=trim(adjustl(variables_to_blend(i))), rc=rc)
       else
          lowBound = 1
          upperBound = nVertLevelsPerVariable(i)
          fields(i) = ESMF_FieldCreate(the_mesh, &
                      typekind=ESMF_TYPEKIND_R8, &
                      meshloc=ESMF_MESHLOC_ELEMENT, &
-                     name=variables_to_blend(i), &
+                     name=trim(adjustl(variables_to_blend(i))), &
                      ungriddedLBound=(/lowBound/), &
                      ungriddedUBound=(/upperBound/), rc=rc)
       endif
@@ -90,14 +96,14 @@ subroutine define_bundle_grid(localpet,the_mesh,bundle)
          fields(i) = ESMF_FieldCreate(the_mesh, &
                      typekind=ESMF_TYPEKIND_R8, &
                      staggerloc=ESMF_STAGGERLOC_CENTER, &
-                     name=variables_to_blend(i), rc=rc)
+                     name=trim(adjustl(variables_to_blend(i))), rc=rc)
       else
          lowBound = 1
          upperBound = nVertLevelsPerVariable(i)
          fields(i) = ESMF_FieldCreate(the_mesh, &
                      typekind=ESMF_TYPEKIND_R8, &
                      staggerloc=ESMF_STAGGERLOC_CENTER, &
-                     name=variables_to_blend(i), &
+                     name=trim(adjustl(variables_to_blend(i))), &
                      ungriddedLBound=(/lowBound/), &
                      ungriddedUBound=(/upperBound/), rc=rc)
       endif
@@ -136,32 +142,35 @@ function add_subtract_bundles(localpet,operation,bundle1,bundle2,w1,w2) result(b
    !if(localpet==0)write(*,*)'In add_subtract_bundles'
 
     ! get the number of fields from the bundle
-    call get_num_fields_bundle(bundle1, nfields)
+    call bundle_get_num_fields(bundle1, nfields)
 
     allocate(fields1(nfields))
     allocate(fields2(nfields))
     allocate(fields_out(nfields))
 
-    call ESMF_FieldBundleGet(bundle1, fieldList=fields1, &
-                             itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-                             rc=rc)
-    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-       call error_handler("IN EMSF_FieldBundleGet field1", rc)
+    call bundle_get_fields(bundle1, fields1)
+   !call ESMF_FieldBundleGet(bundle1, fieldList=fields1, &
+   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
+   !                         rc=rc)
+   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+   !   call error_handler("IN EMSF_FieldBundleGet field1", rc)
 
-    call ESMF_FieldBundleGet(bundle2, fieldList=fields2, &
-                             itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-                             rc=rc)
-    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-       call error_handler("IN EMSF_FieldBundleGet field2", rc)
+    call bundle_get_fields(bundle2, fields2)
+   !call ESMF_FieldBundleGet(bundle2, fieldList=fields2, &
+   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
+   !                         rc=rc)
+   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+   !   call error_handler("IN EMSF_FieldBundleGet field2", rc)
 
     ! define bundle_out
     call ESMF_FieldBundleGet(bundle1, mesh=the_mesh, rc=rc)
     call define_bundle(localpet, the_mesh, bundle_out)
-    call ESMF_FieldBundleGet(bundle_out, fieldList=fields_out, &
-                             itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-                             rc=rc)
-    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-       call error_handler("IN EMSF_FieldBundleGet field_out", rc)
+    call bundle_get_fields(bundle_out, fields_out)
+   !call ESMF_FieldBundleGet(bundle_out, fieldList=fields_out, &
+   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
+   !                         rc=rc)
+   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+   !   call error_handler("IN EMSF_FieldBundleGet field_out", rc)
 
    ! compute perturbations
    do i = 1,nfields
@@ -226,35 +235,35 @@ function add_subtract_bundles(localpet,operation,bundle1,bundle2,w1,w2) result(b
        call error_handler("IN ESMF_FieldBundleAddReplace", rc)
 
     ! clean-up
-    deallocate(fields1, fields2, fields_out )
+    deallocate(fields1, fields2, fields_out)
 
     return
 
 end function add_subtract_bundles
 
-subroutine cleanup_bundles(input_bundle)
+subroutine cleanup_bundle(input_bundle)
    type(esmf_fieldbundle), intent(inout) :: input_bundle
 
    type(esmf_field), allocatable    :: fields(:)
    integer :: i, rc, nvars
 
-  ! This call doesn't work for some reason.
-  !call get_num_fields_bundle(input_bundle,nvars)
-   call ESMF_FieldBundleGet(input_bundle, fieldCount=nvars, &
-                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   call bundle_get_num_fields(input_bundle,nvars)
+
    allocate(fields(nvars))
-   call ESMF_FieldBundleGet(input_bundle, fieldList=fields, &
-                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-                         rc=rc)
+   call bundle_get_fields(input_bundle,fields)
+  !call ESMF_FieldBundleGet(input_bundle, fieldList=fields, &
+  !                      itemorderflag=ESMF_ITEMORDER_ADDORDER, &
+  !                      rc=rc)
    do i = 1, nvars
       call ESMF_FieldDestroy(fields(i), rc=rc)
    enddo
    call ESMF_FieldBundleDestroy(input_bundle)
    deallocate(fields)
 
-end subroutine cleanup_bundles
+end subroutine cleanup_bundle
 
-subroutine get_num_fields_bundle(my_bundle,nfields)
+! get the number of fields from the bundle
+subroutine bundle_get_num_fields(my_bundle,nfields)
    type(esmf_fieldbundle), intent(in) :: my_bundle
    integer, intent(inout) :: nfields
    integer :: rc
@@ -263,9 +272,30 @@ subroutine get_num_fields_bundle(my_bundle,nfields)
                             itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
       call error_handler("IN EMSF_FieldBundleGet fieldCount", rc)
+end subroutine bundle_get_num_fields
 
-   return
+! get the esmf fields (esmf_field type) from the bundle
+subroutine bundle_get_fields(my_bundle,fields)
+   type(esmf_fieldbundle), intent(in) :: my_bundle
+   type(esmf_field), dimension(:), intent(inout) :: fields
+   integer :: rc
 
-end subroutine get_num_fields_bundle
+   call ESMF_FieldBundleGet(my_bundle, fieldList=fields, &
+                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet fieldList", rc)
+end subroutine bundle_get_fields
+
+! get the names of the fields from the bundle
+subroutine bundle_get_field_names(my_bundle,field_names)
+   type(esmf_fieldbundle), intent(in) :: my_bundle
+   character(len=*), dimension(:), intent(inout) :: field_names
+   integer :: rc
+
+   call ESMF_FieldBundleGet(my_bundle, fieldNameList=field_names, &
+                            itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=rc)
+   if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
+      call error_handler("IN EMSF_FieldBundleGet fieldNameList", rc)
+end subroutine bundle_get_field_names
 
 end module bundles_mod

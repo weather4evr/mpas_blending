@@ -42,7 +42,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
    integer                          :: header_buffer_val = 16384
    integer                          :: dim_time, dim_z, dim_zp1, dim_soil, my_dim_z
    integer                          :: dim_ncells, nCells, ncid, dim_nedges
-   integer                          :: id_lat, id_lon, id_times, id_var, id_var2
+   integer                          :: id_lat, id_lon, id_times, id_var, id_var2, id_mask
    integer                          :: id_dim, ndims, nvars, ngatts,unlimdimid
    integer                          :: idims,dimsval,ivars,idims2,igatts
    integer                          :: varstype,varsndims,varsdimids(4),varsnatts, ivarsnatts
@@ -155,18 +155,20 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
       endif !get_metadata_from_template
 
       ! Define latitude/longitude. Make sure it's not already there first
-      !  If it there, error == nf90_noerr
+      !  If it's there, error == nf90_noerr
       ! Either way, if it's already there, or we define it, we also
       !  define id_lat, id_lon
       error = nf90_inq_varid(ncidout, 'latCell', id_lat)
       if (error /= nf90_noerr) then
-         error = nf90_def_var(ncidout, 'latCell', NF90_FLOAT, (/dim_ncells, dim_time/), id_lat)
+        !error = nf90_def_var(ncidout, 'latCell', NF90_FLOAT, (/dim_ncells, dim_time/), id_lat)
+         error = nf90_def_var(ncidout, 'latCell', NF90_FLOAT, (/dim_ncells/), id_lat)
          call netcdf_err(error, 'Defining latCell')
       endif
 
       error = nf90_inq_varid(ncidout, 'lonCell', id_lon)
       if (error /= nf90_noerr) then
-         error = nf90_def_var(ncidout, 'lonCell', NF90_FLOAT, (/dim_ncells, dim_time/), id_lon)
+        !error = nf90_def_var(ncidout, 'lonCell', NF90_FLOAT, (/dim_ncells, dim_time/), id_lon)
+         error = nf90_def_var(ncidout, 'lonCell', NF90_FLOAT, (/dim_ncells /), id_lon)
          call netcdf_err(error, 'Defining lonCell')
       endif
 
@@ -182,8 +184,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
 
    allocate(fields(nvars_to_blend))
    call ESMF_FieldBundleGet(input_bundle, fieldList=fields, &
-                    itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-                    rc=error)  ! can probably move outside the loop
+                    itemorderflag=ESMF_ITEMORDER_ADDORDER, rc=error) 
    if(ESMF_logFoundError(rcToCheck=error,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
         call error_handler("IN FieldBundleGet", error)
 
@@ -204,6 +205,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
            !print*, "- WRITE TO FILE ", trim(varname)
             dum1dt(:,1) = dum1d
             error = nf90_inq_varid(ncidout, trim(adjustl(varname)), id_var2)
+            call netcdf_err(error, 'Getting ID')
             error = nf90_put_var( ncidout, id_var2, dum1dt, count=(/nCells,1/) )
             call netcdf_err(error, 'WRITING RECORD')
          endif
@@ -229,6 +231,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
            !print*, "- WRITE TO FILE ", trim(varname)
             dum2dt(:,:,1) = transpose(dum2d)
             error = nf90_inq_varid( ncidout, trim(adjustl(varname)), id_var2)
+            call netcdf_err(error, 'Getting ID')
             error = nf90_put_var( ncidout, id_var2, dum2dt, count=(/nz,nCells,1/) )
             call netcdf_err(error, 'WRITING RECORD' )
          endif
@@ -244,7 +247,8 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
    if (localpet ==0) then
       dum1dt(:,1) = mpas_mesh%latCell
       error = nf90_inq_varid(ncidout, 'latCell', id_lat)
-      error = nf90_put_var( ncidout, id_lat, dum1dt, start=(/1,1/), count=(/nCells,1/) )
+     !error = nf90_put_var( ncidout, id_lat, dum1dt, start=(/1,1/), count=(/nCells,1/) )
+      error = nf90_put_var( ncidout, id_lat, dum1dt(:,1), start=(/1/), count=(/nCells/) )
       call netcdf_err(error, 'WRITING LATITUDE RECORD' )
    endif
 
@@ -252,8 +256,17 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
    if (localpet ==0) then
       dum1dt(:,1) = mpas_mesh%lonCell
       error = nf90_inq_varid(ncidout, 'lonCell', id_lon)
-      error = nf90_put_var( ncidout, id_lon, dum1dt, start=(/1,1/), count=(/nCells,1/) )
+     !error = nf90_put_var( ncidout, id_lon, dum1dt, start=(/1,1/), count=(/nCells,1/) )
+      error = nf90_put_var( ncidout, id_lon, dum1dt(:,1), start=(/1/), count=(/nCells/) )
       call netcdf_err(error, 'WRITING LONGITUDE RECORD' )
+   endif
+
+   ! bdyCell-need to create the variable
+   if (localpet ==0) then
+      dum1dt(:,1) = mpas_mesh%bdyMaskCell
+      error = nf90_def_var(ncidout, 'bdyMaskCell', NF90_INT, (/dim_ncells /), id_mask)
+      error = nf90_put_var( ncidout, id_mask, dum1dt(:,1), start=(/1/), count=(/nCells/) )
+      call netcdf_err(error, 'WRITING bdyMaskCell RECORD' )
    endif
 
    !times
@@ -301,7 +314,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
       call open_netcdf(trim(grid_files_heirarchy(1)),ncid)
       call get_netcdf_var(ncid,'edgesOnCell',(/1,1/),(/mpas_mesh%maxEdges,nCells/),edgesOnCell)
       call get_netcdf_var(ncid,'cellsOnEdge',(/1,1/),(/2,mpas_mesh%nEdges/),cellsOnEdge)
-      call close_netcdf(trim(file_template),ncid)
+      call close_netcdf(trim(grid_files_heirarchy(1)),ncid)
 
       ! open the file with blended data that we  just wrote
       !  for reading only. get data, then close it.
@@ -338,9 +351,9 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
       error = nf90_open(path=trim(adjustl(output_file)), mode=nf90_write,ncid=ncid)
       error = nf90_def_var(ncid, 'u', NF90_FLOAT, (/dim_z, dim_nedges, dim_time/), id_var)
       error = nf90_put_var(ncid, id_var, edge_normal_wind)
+      call netcdf_err(error, 'WRITING U')
       error = nf90_put_att(ncid, id_var, "units", "m s^{-1}")
       error = nf90_put_att(ncid, id_var, "long_name", "Horizontal normal velocity at edges")
-      call netcdf_err(error, 'WRITING U')
       error = nf90_close(ncid)
       call netcdf_err(error, 'CLOSING OUTPUT FILE' )
 
