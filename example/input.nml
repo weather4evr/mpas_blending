@@ -1,0 +1,37 @@
+&share 
+   grid_info_file = './grid_info.txt'
+   large_scale_file = '/glade/derecho/scratch/harrold/hwt/for_craig/init_2022050100_ens1_hrrrICgfsLBC.nc'
+   small_scale_file = '/glade/derecho/scratch/harrold/hwt/for_craig/init_2022050100_ens0_enkfICgefsLBC.nc'
+   output_blended_filename = 'blended.nc'
+   variables_to_blend = 't2m','theta','qv','uReconstructZonal','uReconstructMeridional'
+   average_upscale_before_interp = .true.
+   interp_method = 'conserve1'
+   extrap_method = 'mpas_nearest'
+   extrap_num_levels_creep = 64
+   output_intermediate_files_up   = .true.
+   output_intermediate_files_down = .true.
+   output_blended_edge_normal_wind = .true.
+   smooth_going_downscale = .false. 
+   smoother_dimensionless_coefficient = 0.1
+   esmf_log = .true.
+/
+   extrap_method = 'esmf_nearest', 'esmf_creep', 'mpas_nearest'
+   interp_method = 'bilinear', interp_method = 'conserve1'
+
+! 0.25-degree global grid
+&latlon_output
+   output_latlon_grid = .true.
+   is_regional = .false.
+   nlat = 721
+   nlon = 1440
+   lat_ll = -90.
+   lon_ll = 0.
+   dx_in_degrees = 0.25
+   extrap_method_latlon = 'none'
+/
+   ! 0.5-degree global grid
+   nlat = 361
+   nlon = 720
+   lat_ll = -90.
+   lon_ll = 0.
+   dx_in_degrees = 0.50

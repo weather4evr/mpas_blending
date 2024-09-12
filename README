@@ -1,14 +1,10 @@
-This program blends fields from two MPAS files together...more info later.
-
+This program blends fields from two MPAS files together
 
 Compiling instructions: 
 
-1) Edit build.sh script.  Needed libraries: NETCDF, ESMF, MPI.
-  Note: If working on a RDHPCS machine (Hera, Jet, etc.) no edits should
-  be necessary 
+1) Edit build.sh script.  Needed libraries: NETCDF, ESMF, MPI. Might have to edit some other files...
 
 2) run build.sh
-
 
 Namelist:
 
@@ -41,31 +37,54 @@ Namelist:
    extrap_method_latlon = 'none'
 /
 
+Meaning of namelist variables
+
 &share
 grid_info_file: Path to text file containing information about the grid heirarchy.  See the example file for more details.
+
 large_scale_file : Path to MPAS file that will be used for the large scales, typically something like a GFS analysis interpolated onto the MPAS mesh.
+
 small_scale_file : Path to MPAS file that will be used for the small scales, typically something like an analysis produced by a data assimilation system on a high-resolution MPAS mesh
+
 output_blended_filename : Name of the file with blended fields that will be created by the program. It will be created, but the directory where the file will be placed must exist.
+
 variables_to_blend : List of the MPAS variables (as in the netCDF files) to blend.
+
 average_upscale_before_interp : Logical variable. If true, before interpolating to the next coarsest mesh in the heirarchy, spatially average the field to the scale of the next mesh in the heirarchy.  If false, don't spatially average before interpolating.  Typically set to true.
-interp_method : Interpolation method for interpolating up and down through the heirarchy. Options: 'bilinear' (bilinear interpolation), 'conserve1' (first-order conservative interpolation), 'conserve2' (second-order conservative interpolation), 'nearest' (nearest-neighbor interpolation), 'path' (ESMF's homegrown method that is kind of like bilinear interpolation).  Recommended to use either 'bilinear' or 'conserve1'
+
+interp_method : Interpolation method for interpolating up and down through the heirarchy. Options: 'bilinear' (bilinear interpolation), 'conserve1' (first-order conservative interpolation), 'conserve2' (second-order conservative interpolation), 'nearest' (nearest-neighbor interpolation), 'path' (ESMF's homegrown method that is kind of like bilinear interpolation).  Recommended to use either 'bilinear' or 'conserve1'.
+
 extrap_method : If the input mesh is global, this variable is ignored.  If it's a regional mesh (as is typically the case with blending), then an extrapolation option needs to be selected to determine what happens to points that can't be mapped to the next coarsest grid in the heirarch when interpolating; extrapolation is needed to get reasonable fields along the mesh boundary. There may not be too much sensitivity to the option used. Options are "esmf_creep", "esmf_creep_nrst_d", "esmf_nearest_d", "esmf_nearest_stod", and "mpas_nearest".  Those that are prefixed with "esmf" are described here: https://earthsystemmodeling.org/docs/release/latest/ESMF_refdoc/node9.html#opt:extrapmethod (entry 54.17 in the ESMF fortran user's guide).  The "mpas_nearest" is just a nearest neighbor extrapolation. All except "esmf_creep" will fill the entire meshes.  The "esmf_creep", and "mpas_nearest" options are the quickest, followed by "esmf_nearest_d". Recommendation is to use "esmf_creep" or "mpas_nearest".
+
 extrap_num_levels_creep : Only used if extrap_method is "esmf_creep" or "esmf_creep_nrst_d"; ignored otherwise. This sets the number of "levels" for which to do extrapolation at points on the target mesh that can't be mapped to the source mesh.  Think of a level as a number of circular rings moving outward from a circular MPAS mesh.  The default value is 64. Depending on what meshes are used in the heirarchy, this value may need to be adjusted.  If values along the boundary after blending look like nonsense, try increasing this value. 
+
 output_intermediate_files_up : Logical variable. If true, output a bunch of files to visualize how the fields are upscaled through the heirarchy. Doesn't impact results. Useful for diagnostics but can be time-consuming, so if not needed, set to false.
+
 output_intermediate_files_down : Logical variable. If true, output a bunch of files to visualize how the fields are downscaled through the heirarchy. Doesn't impact results. Useful for diagnostics but can be time-consuming, so if not needed, set to false.
+
 output_blended_edge_normal_wind : The U and V wind components are the ones that are blended. If true, then after the blended U and V fields are determined, use those blended fields to calculated the edge normal wind, which is MPAS's prognostic variable. Typically should be set to true.
+
 smooth_going_downscale = Logical variable. If true, apply a 2-delta-x smoother when downscaling through the heirarchy. Not well tested, and a bit slow.
+
 smoother_dimensionless_coefficient : Ignored if smooth_going_downscale = false. If smooth_going_downscale = true, this is a coefficent between 0 and 1 that can be used for the smoothing. Not well tested.
+
 esmf_log : Whether to turn on ESMF logging. Typically set to true to output information in the PET files.
 
 
 &latlon_output
 
 output_latlon_grid : Logical variable. If true, output data on a lat-lon grid for easy visualization. Outputting lat-lon files is purely for diagnostic purposes and doesn't impact the blending itself.
+
 is_regional : Logical variable. If true, the parameters below define a regional lat-lon grid.  If false, parameters below define a global lat-lon grid.
+
 nlat : Number of latitudes in the lat-lon grid
+
 nlon : Number of longitudes in the lat-lon grid
+
 lat_ll : Latitude of the lower-left corner of the lat-lon grid
+
 lon_ll : Longitude of the lower-left corner of the lat-lon grid
+
 dx_in_degrees : Grid spacing (degrees) of the lat-lon grid. Applied to both latitude and longitude.
+
 extrap_method_latlon : Extrapolation method for outputting lat-lon grid that will be used for points in the lat-lon grid that don't map to an MPAS mesh. Options are same as above for variable extrap_method, but can also be set to 'none' for no extrapolation. If using "esmf_creep" or "esmf_creep_nrst_d", then extrap_num_levels_creep (from &share namelist) will also apply. Setting to 'none' is probably best, but you can get some odd/cool looking output by setting it to something else.
