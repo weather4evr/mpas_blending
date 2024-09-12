@@ -9,7 +9,7 @@ implicit none
 private
 
 public :: error_handler, sphere_distance, nearest_cell, mark_neighbors_from_source
-public :: gather_on_all_procs
+public :: gather_on_all_procs, print_dstStatus
 
 !integer, parameter,public :: DEBUG=0, INFORM=1, WARN=2, ERROR_CODE=3
 
@@ -104,6 +104,17 @@ real function sphere_distance(lat1, lon1, lat2, lon2, radius)
    sphere_distance = 2.*radius*asin(arg1)
 
 end function sphere_distance
+
+subroutine print_dstStatus(localpet,dstStatus)
+   integer, intent(in) :: localpet
+   integer, intent(in), dimension(:) :: dstStatus
+   integer :: j
+   if (localpet == 0 ) then
+      do j = 0,8
+         write(*,*)'num status = ',j,' = ',count(dstStatus == j)
+      enddo
+   endif
+end subroutine print_dstStatus
 
 subroutine gather_on_all_procs_real_1d(localpet,input_field,dims,output_field)
    integer, intent(in) :: localpet

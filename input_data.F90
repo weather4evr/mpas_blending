@@ -37,7 +37,7 @@ subroutine set_nVertLevelsPerVariable(localpet,the_file)
    ! open the netCDF file with the data we want to read
    call open_netcdf(trim(the_file),ncid)
 
-   if (localpet==0) print*, "GETTING INPUT DATA FROM", trim(adjustl(the_file))
+   if (localpet==0) write(*,*) "GETTING INPUT DATA FROM"//trim(adjustl(the_file))
 
    do i = 1,nvars_to_blend
        
@@ -100,8 +100,6 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
    real(esmf_kind_r8), allocatable :: dummy2(:,:), dummy3(:,:,:)
    real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
 
-  !include 'mpif.h'
-
    nCells_input = mpas_mesh%nCells
    nCellsPerPET = mpas_mesh%nCellsPerPET
 
@@ -122,7 +120,7 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
 
       vname = trim(adjustl(variables_to_blend(i)))
 
-      if (localpet==0) print*, "- INIT FIELD ", vname
+      if (localpet==0) write(*,*) "- INIT FIELD ", vname
 
       lowBound = 1
       nz = nVertLevelsPerVariable(i)
@@ -153,7 +151,7 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
          deallocate(dummy3)
       endif
            
-      if (localpet==0) print*,"- SET ON MESH ", trim(vname)
+      if (localpet==0) write(*,*) "- SET ON MESH ", trim(vname)
 
    enddo ! end loop over number of variables
 
@@ -166,8 +164,8 @@ subroutine read_input_data(localpet,input_mesh,mpas_mesh,the_file,bundle)
 
    call close_netcdf(trim(the_file),ncid)
 
-   if (localpet==0) print*, "DONE GETTING DATA FROM ",trim(adjustl(the_file))
-   if (localpet==0) print*, ""
+   if (localpet==0) write(*,*) "DONE GETTING DATA FROM ",trim(adjustl(the_file))
+   if (localpet==0) write(*,*)''
 
 end subroutine read_input_data
 

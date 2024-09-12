@@ -4,10 +4,10 @@ use mpi
 use esmf
 use netcdf
 use utils_mod, only : error_handler, sphere_distance, nearest_cell, gather_on_all_procs
-use model_grid, only : mpas_mesh_type, mask_value, ignore_value, INSIDE, UNMARKED
+use model_grid, only : mpas_mesh_type, mask_value, ignore_value, INSIDE, UNMARKED, regional_mesh
 use input_data, only : nVertLevelsPerVariable
 use bundles_mod, only : bundle_get_num_fields, bundle_get_fields, bundle_get_field_names
-use program_setup, only  : variables_to_blend
+use program_setup, only  : variables_to_blend, extrap_num_levels_creep, interp_method, extrap_method
 
 implicit none
 
@@ -15,10 +15,9 @@ private
  
 ! Public subroutines
 public :: interp_data, radially_average, apply_smoothing_filter
-public :: force_masked_data_to_missing
 public :: make_rh, destroy_rh
-public :: force_masked_data_to_value, force_certain_data_to_value, update_mask, extrapolate_nearest_neigh_on_impacted_points
-public :: extrapolate
+public :: force_masked_data_to_value, force_certain_data_to_value, update_mask
+public :: set_global_extrapolation, extrapolate
 
 ! Variables private to this module
 integer ::  isrctermprocessing = 1
@@ -48,8 +47,8 @@ subroutine interp_data(localpet,my_rh,input_bundle,target_bundle)
    type(ESMF_GeomType_Flag) :: geomtype
 
    !if ( ESMF_RouteHandleIsCreated(routehandle, rc=rc)) then   ... 
-
-  !if(localpet==0)write(*,*)'In interp_data'
+   ! this will make  copy of a route handle (Not used)
+   !my_rh = ESMF_RouteHandleCreate(rh_bilin, rc=rc)
 
    ! get the number of fields from the bundle
    call bundle_get_num_fields(input_bundle,nfields)
@@ -63,9 +62,6 @@ subroutine interp_data(localpet,my_rh,input_bundle,target_bundle)
    allocate(fields_target_grid(nfields))
    call bundle_get_fields(input_bundle,fields_input_grid)
    call bundle_get_fields(target_bundle,fields_target_grid)
-
-   ! this will make  copy of a route handle (Not used)
-   !my_rh = ESMF_RouteHandleCreate(rh_bilin, rc=rc)
    
    do i = 1,nfields
    
@@ -86,7 +82,7 @@ subroutine interp_data(localpet,my_rh,input_bundle,target_bundle)
 
    enddo
 
-   if(localpet==0)write(*,*)'Done interpolating fields'
+  !if(localpet==0)write(*,*)'Done interpolating fields'
 
    ! update the fields in target_bundle
    call ESMF_FieldBundleAddReplace(target_bundle, fields_target_grid, rc=rc)
@@ -317,138 +313,6 @@ subroutine update_mask(localpet,mpas_mesh,bundle,threshold_value,mask_field,targ
 
 end subroutine update_mask
 
-subroutine extrapolate_nearest_neigh_on_impacted_points(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2)
- 
-   integer, intent(in)                   :: localpet
-   type(mpas_mesh_type), intent(inout)   :: mpas_mesh
-   type(esmf_fieldbundle), intent(inout) :: bundle
-   type(mpas_mesh_type), optional, intent(in)   :: mpas_mesh2
-   type(esmf_fieldbundle), optional, intent(in) :: bundle2
-
-   integer                          :: rc, i, nfields, j, k,nz
-   integer                          :: cell_start, cell_end, closest_cell
-   integer, allocatable             :: bdyMaskCell(:)
-   type(ESMF_Field), allocatable    :: fields(:), fields2(:)
-   real(esmf_kind_r8), pointer      :: varptr(:), varptr2(:,:)
-   real(esmf_kind_r8), pointer      :: varptr_a(:), varptr2_a(:,:)
-   real*8, allocatable :: dummy1(:), dummy2(:,:)
-   type(ESMF_GeomType_Flag) :: geomtype
-   logical :: found_good_data
-
-   call ESMF_FieldBundleGet(bundle, geomtype=geomtype)
-   if ( geomtype == ESMF_GEOMTYPE_MESH ) then ! only do for meshes, not ESMF grids
-      if(localpet==0)write(*,*)'In extrapolate_nearest_neigh_on_impacted_points'
-
-      ! get the number of fields from the bundle
-      call bundle_get_num_fields(bundle,nfields)
-
-      ! get the fields from the bundle
-      allocate(fields(nfields))
-      call bundle_get_fields(bundle,fields)
-
-      ! get the fields from the bundle on the other mesh
-      allocate(fields2(nfields))
-      call bundle_get_fields(bundle2,fields2)
-
-      ! mpas_mesh%bdyMaskCell is over the whole mesh, so we need to know the per-PE indices
-      cell_start = mpas_mesh%cell_start
-      cell_end = mpas_mesh%cell_end
-      allocate(bdyMaskCell(1:mpas_mesh%nCellsPerPET))
-      bdyMaskCell(1:mpas_mesh%nCellsPerPET) = mpas_mesh%bdyMaskCell(cell_start:cell_end)
-
-      do i = 1,nfields
-
-         if ( nVertLevelsPerVariable(i) == 1 ) then
-            call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
-            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-               call error_handler("IN FieldGet", rc)
-
-            if ( 1 == 1 ) then ! use our own nereast neighbor algorithm
-               ! get the full-field data from the second input mesh--probably a higher-resolution mesh
-               allocate(dummy1(mpas_mesh2%nCells)) ! on all processors
-               call gather_on_all_procs(localpet, fields2(i), (/mpas_mesh2%nCells/), dummy1)
-
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr(j) < real(ignore_value*1.0,esmf_kind_r8) .and. bdyMaskCell(j) .ne. mask_value ) then ! don't want mask points; just points influenced by mask
-                     found_good_data = .false.
-                     closest_cell = -1
-                     call find_nearest_nonmissing_cell(mpas_mesh%elemIDs(j), mpas_mesh, mpas_mesh2, dummy1, closest_cell, found_good_data)
-                     if ( closest_cell > 0 ) then
-                        varptr(j) = dummy1(closest_cell)
-                     else
-                        if(localpet == 0 ) write(*,*)'unable to find closest_cell'
-                     endif
-                  endif
-               enddo
-               if(localpet == 0 ) write(*,*)'done with find_nearest_nonmissing_cell'
-               deallocate(dummy1)
-               nullify(varptr)
-            else ! use the nearest neighbor bundle
-               call ESMF_FieldGet(fields2(i), farrayPtr=varptr_a, rc=rc) ! varptr is decomposed across all processors
-               if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-                  call error_handler("IN FieldGet field2", rc)
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr(j) < real(ignore_value*1.0,esmf_kind_r8) .and. bdyMaskCell(j) .ne. mask_value ) then ! don't want mask points; just points influenced by mask
-                     varptr(j) = varptr_a(j)
-                  endif
-               enddo
-               nullify(varptr_a)
-            endif
-         else
-            call ESMF_FieldGet(fields(i), farrayPtr=varptr2, rc=rc) ! varptr2 is decomposed across all processors
-            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-               call error_handler("IN FieldGet", rc)
-
-            nz = nVertLevelsPerVariable(i)
-            ! get the full-field data from the second input mesh--probably a higher-resolution mesh
-            if ( 1 == 1 ) then
-               allocate(dummy2(mpas_mesh2%nCells,nz)) ! on all processors
-               call gather_on_all_procs(localpet, fields2(i), (/mpas_mesh2%nCells,nz/), dummy2)
-
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr2(j,1) < real(ignore_value*1.0,esmf_kind_r8) .and. bdyMaskCell(j) .ne. mask_value ) then ! don't want mask points; just points influenced by mask
-                     found_good_data = .false.
-                     closest_cell = -1
-                     call find_nearest_nonmissing_cell(mpas_mesh%elemIDs(j), mpas_mesh, mpas_mesh2, dummy2(:,1), closest_cell, found_good_data)
-                     if ( closest_cell > 0 ) then
-                        varptr2(j,:) = dummy2(closest_cell,:)
-                     else
-                        if(localpet == 0 ) write(*,*)'unable to find closest_cell'
-                     endif
-                  endif
-               enddo
-               if(localpet == 0 ) write(*,*)'done with find_nearest_nonmissing_cell'
-               deallocate(dummy2)
-               nullify(varptr2)
-            else
-               call ESMF_FieldGet(fields2(i), farrayPtr=varptr2_a, rc=rc) ! varptr is decomposed across all processors
-               if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-                  call error_handler("IN FieldGet", rc)
-               do j = 1,mpas_mesh%nCellsPerPET
-                  do k = 1,nz
-                     if ( varptr2(j,k) < real(ignore_value*1.0,esmf_kind_r8) .and. bdyMaskCell(j) .ne. mask_value ) then ! don't want mask points; just points influenced by mask
-                        varptr2(j,k) = varptr2_a(j,k)
-                     endif
-                  enddo
-               enddo
-               nullify(varptr2_a)
-            endif
-         endif
-      enddo ! loop over nfields
-
-      ! update the fields in bundle
-      call ESMF_FieldBundleAddReplace(bundle, fields, rc=rc)
-      if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-         call error_handler("IN ESMF_FieldBundleAddReplace", rc)
-
-      ! clean-up
-      deallocate(fields,fields2)
-      deallocate(bdyMaskCell)
-
-   endif
-
-end subroutine extrapolate_nearest_neigh_on_impacted_points
-
 subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoints)
  
    integer, intent(in)                   :: localpet
@@ -481,8 +345,9 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
       allocate(fields2(nfields))
       call bundle_get_fields(bundle2,fields2)
 
-      num_unmapped = size(unmappedPoints)
+      num_unmapped = size(unmappedPoints) ! unique to this processor
 
+     !if ( num_unmapped > 0 ) then
       do i = 1,nfields
          if ( nVertLevelsPerVariable(i) == 1 ) then
             call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
@@ -555,6 +420,8 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
       if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
          call error_handler("IN ESMF_FieldBundleAddReplace", rc)
 
+     !endif ! ( num_unmapped > 0 ) then
+
       ! clean-up
       deallocate(fields,fields2)
 
@@ -562,173 +429,13 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
 
 end subroutine extrapolate
 
-subroutine force_masked_data_to_missing(localpet,mpas_mesh,bundle,update_bdyMaskCell,mpas_mesh2,bundle2)
- 
-   integer, intent(in)                   :: localpet
-   type(mpas_mesh_type), intent(inout)   :: mpas_mesh
-   type(esmf_fieldbundle), intent(inout) :: bundle
-   logical, intent(in)                   :: update_bdyMaskCell
-   type(mpas_mesh_type), optional, intent(in)   :: mpas_mesh2
-   type(esmf_fieldbundle), optional, intent(in) :: bundle2
-
-   integer                          :: rc, i, nfields, j, k, elementCount
-   integer                          :: cell_start, cell_end, closest_cell
-   integer, allocatable             :: bdyMaskCell(:)
-   type(ESMF_Field), allocatable    :: fields(:), fields2(:)
-   type(ESMF_Field)                 :: bdyMaskField
-   real(esmf_kind_r8), pointer      :: varptr(:), varptr2(:,:)
-   integer(ESMF_KIND_I4), pointer   :: varptr_mask(:)
-   type(ESMF_Mesh) :: mesh
-   type(ESMF_GeomType_Flag) :: geomtype
-   logical :: need_to_update_bdyMask, got_mask
-   real*8, allocatable :: dummy1(:), dummy2(:,:)
-   real(esmf_kind_r8), allocatable :: dum1d(:), dum2d(:,:)
-   logical :: found_good_data, extrapolate_nn_on_impacted_points
-    
-   call ESMF_FieldBundleGet(bundle, geomtype=geomtype)
-   if ( geomtype == ESMF_GEOMTYPE_MESH ) then ! only do for meshes, not ESMF grids
-      if(localpet==0)write(*,*)'In force_masked_data_to_missing'
-
-      ! get the number of fields from the bundle
-      call bundle_get_num_fields(bundle,nfields)
-
-      ! get the fields from the bunlde
-      allocate(fields(nfields))
-      call bundle_get_fields(bundle,fields)
-
-      if( present(mpas_mesh2)) then
-         allocate(fields2(nfields))
-         call bundle_get_fields(bundle2,fields2)
-          extrapolate_nn_on_impacted_points = .true.
-      else
-          extrapolate_nn_on_impacted_points = .false.
-      endif
-
-      ! sanity check
-      call ESMF_FieldBundleGet(bundle, mesh=mesh)
-      call ESMF_MeshGet(mesh, elementCount=elementCount, rc=rc)
-      if ( elementCount /= mpas_mesh%nCellsPerPET ) then
-         call error_handler("Wrong number of cells in force_masked_data_to_missing", -43)
-      endif
-
-      ! mpas_mesh%bdyMaskCell is over the whole mesh, so we need to know the per-PE indices
-      cell_start = mpas_mesh%cell_start
-      cell_end = mpas_mesh%cell_end
-      allocate(bdyMaskCell(1:mpas_mesh%nCellsPerPET))
-      bdyMaskCell(1:mpas_mesh%nCellsPerPET) = mpas_mesh%bdyMaskCell(cell_start:cell_end)
-
-      ! create an ESMF field for bdyMaskCell; this has the ESMF parallelization, so the field
-      !  is defined on each processor
-      ! define the field, then initialize it to the mask; it may be modified later
-      bdyMaskField = ESMF_FieldCreate(mesh, &
-                     typekind=ESMF_TYPEKIND_I4, &
-                     meshloc=ESMF_MESHLOC_ELEMENT, &
-                     name='bdyMaskField', rc=rc)
-      call ESMF_FieldGet(bdyMaskField, farrayPtr=varptr_mask, rc=rc)
-      if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-         call error_handler("IN FieldGet bdyMaskField", rc)
-      do j = 1,mpas_mesh%nCellsPerPET
-         varptr_mask(j) = bdyMaskCell(j) ! initialize
-      enddo
-
-      ! ...where masked, force the interpolated field to missing, rather than 0, which is what ESMF does...
-      need_to_update_bdyMask = .true.
-      got_mask = .false.
-      do i = 1,nfields
-         if ( nVertLevelsPerVariable(i) == 1 ) then
-            call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
-            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-               call error_handler("IN FieldGet", rc)
-            where( bdyMaskCell == mask_value )  varptr = real(mask_value*1.0,esmf_kind_r8) ! 0 --> mask_value at masked locations
-
-            if ( extrapolate_nn_on_impacted_points ) then
-               ! get the full-field data from the second input mesh--probably a higher-resolution mesh
-               if (localpet==0) allocate(dum1d(mpas_mesh2%nCells))
-               allocate(dummy1(mpas_mesh2%nCells)) ! on all processors
-               call ESMF_FieldGather(fields2(i), dum1d, rootPet=0, rc=rc) ! gather on process 0
-               if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
-                  call error_handler("IN FieldGather", rc)
-               if (localpet == 0 ) dummy1 = dum1d
-               call mpi_bcast(dummy1,mpas_mesh2%nCells,mpi_real8,0,mpi_comm_world,rc) ! dummy1 on all processors
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr(j) < real(ignore_value*1.0,esmf_kind_r8) .and. bdyMaskCell(j) .ne. mask_value ) then ! don't want mask points; just points influenced by mask
-                     found_good_data = .false.
-                     closest_cell = -1
-                     call find_nearest_nonmissing_cell(mpas_mesh%elemIDs(j), mpas_mesh, mpas_mesh2, dummy1, closest_cell, found_good_data)
-                     if ( closest_cell > 0 ) then
-                        varptr(j) = dummy1(closest_cell)
-                     else
-                        if(localpet == 0 ) write(*,*)'unable to find closest_cell'
-                     endif
-                  endif
-               enddo
-               if (localpet==0) deallocate(dum1d)
-               deallocate(dummy1)
-            else
-               where( varptr < real(ignore_value*1.0,esmf_kind_r8)) varptr = real(mask_value*1.0,esmf_kind_r8) ! points influenced by masked out values
-            endif
-            if ( update_bdyMaskCell .and. need_to_update_bdyMask ) then
-              !write(*,*)'num corrected = 'count(varptr < real(ignore_value*1.0,esmf_kind_r8))
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr(j) < real(ignore_value*1.0,esmf_kind_r8)) varptr_mask(j) = mask_value
-               enddo
-               got_mask = .true.
-            endif
-
-            nullify(varptr)
-         else
-            call ESMF_FieldGet(fields(i), farrayPtr=varptr2, rc=rc) ! varptr2 is decomposed across all processors
-            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__line__,file=__file__)) &
-               call error_handler("IN FieldGet", rc)
-            do k = 1,nVertLevelsPerVariable(i)
-               where( bdyMaskCell == mask_value )   varptr2(:,k) = real(mask_value*1.0,esmf_kind_r8)
-               where( varptr2(:,k) < real(ignore_value*1.0,esmf_kind_r8) ) varptr2(:,k) = real(mask_value*1.0,esmf_kind_r8)
-            enddo
-            if ( update_bdyMaskCell .and. need_to_update_bdyMask ) then
-              !write(*,*)'num corrected = 'count(varptr2(j,1) < real(ignore_value*1.0,esmf_kind_r8))
-               do j = 1,mpas_mesh%nCellsPerPET
-                  if ( varptr2(j,1) < real(ignore_value*1.0,esmf_kind_r8) ) varptr_mask(j) = mask_value
-               enddo
-               got_mask = .true.
-            endif
-            nullify(varptr2)
-         endif
-         ! the mask should be the same for all variables, so we should only have to update it once
-         if ( got_mask .and. need_to_update_bdyMask ) then
-            ! we want bdyMaskField on the full grid on all processors
-        
-            call ESMF_FieldGather(bdyMaskField, mpas_mesh%bdyMaskCell, rootPet=0, rc=rc) ! gather on process 0
-            if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
-                  call error_handler("IN FieldGather", rc)
-            call mpi_bcast(mpas_mesh%bdyMaskCell,mpas_mesh%nCells,mpi_integer,0,mpi_comm_world,rc) ! broadcast to all processors
-            need_to_update_bdyMask = .false.
-         endif
-      enddo
-      deallocate(bdyMaskCell)
-
-      ! update the fields in bundle
-      call ESMF_FieldBundleAddReplace(bundle, fields, rc=rc)
-      if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-         call error_handler("IN ESMF_FieldBundleAddReplace", rc)
-
-      ! clean-up
-      deallocate(fields)
-      nullify(varptr_mask)
-      if ( extrapolate_nn_on_impacted_points ) deallocate(fields2)
-
-      ! done with bdyMaskField, so get rid of it.
-      call ESMF_FieldDestroy(bdyMaskField, rc=rc)
-
-   endif ! endif geomtype == ESMF_GEOMTYPE_MESH
-
-end subroutine force_masked_data_to_missing
-                
-subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmappedDstList,dstStatus)
+subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,my_extrap_method,rh,unmappedDstList,dstStatus)
 
    integer, intent(in)                   :: localpet
    type(esmf_fieldbundle), intent(in)    :: input_bundle
    type(esmf_fieldbundle), intent(in)    :: target_bundle
    character(len=*), intent(in)          :: my_interp_method
+   character(len=*), intent(in)          :: my_extrap_method
    type(ESMF_RouteHandle), intent(inout) :: rh
    integer(ESMF_KIND_I4), pointer, intent(inout)  :: unmappedDstList(:)
    integer, dimension(:), intent(inout), optional :: dstStatus
@@ -740,6 +447,7 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmap
    type(ESMF_Grid)              :: grid
    type(ESMF_GeomType_Flag)     :: geomtype
    type(ESMF_NormType_Flag)     :: normType
+   type(ESMF_ExtrapMethod_Flag) :: extrapMethod
 
    ! get a field from the input and target bundles
    call ESMF_FieldBundleGet(input_bundle, trim(adjustl(variables_to_blend(1))), field=input_field, rc=rc)
@@ -764,8 +472,10 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmap
    else
       call error_handler("Invalid interpolation method = "//my_interp_method, -223)
    endif
+   if(localpet==0)write(*,*)'In make_rh; using interp method '//trim(my_interp_method)//' and extrap method '//trim(my_extrap_method)
 
-   if(localpet==0)write(*,*)'In make_rh; using method '//trim(my_interp_method)
+   ! figure out the extrapolation option (set extrapMethod)
+   call set_local_extrapolation_option(my_interp_method,my_extrap_method,extrapMethod)
 
    ! make an ESMF field that will hold the status for each destination point
    !  in the interpolation. We can use it to find points that could not be
@@ -793,10 +503,11 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmap
                                unmappedaction=ESMF_UNMAPPEDACTION_IGNORE,&
                                dstStatusField=dstStatusField, &
                                unmappedDstList=unmappedDstList, &
+                               extrapMethod=extrapMethod, &
+                               extrapNumLevels=extrap_num_levels_creep, &
                                normType=ESMF_NORMTYPE_FRACAREA, &
                                rc=rc)
                              ! extrapMethod=ESMF_EXTRAPMETHOD_CREEP, &
-                             ! extrapNumLevels=8, &
                              ! srcMaskValues=(/mask_value/), &
                              ! dstMaskValues=(/mask_value/), &
                              ! extrapMethod=ESMF_EXTRAPMETHOD_NEAREST_D, &
@@ -804,7 +515,7 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmap
       call error_handler("IN FieldRegridStore", rc)
 
    ! values in unmappedDstList are the GLOBAL cell IDs across the whole MPAS mesh, which is nice
-   write(*,*)'mype, size(list), min/min = ',localpet,size(unmappedDstList),minval(unmappedDstList),maxval(unmappedDstList)
+  !write(*,*)'mype, size(list), min/min = ',localpet,size(unmappedDstList),minval(unmappedDstList),maxval(unmappedDstList)
 
    ! we want dstStatusField on the full grid on all processors
    if ( present(dstStatus)) then
@@ -820,11 +531,11 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,rh,unmap
 
 end subroutine make_rh
 
+! get rid of the route handle
 subroutine destroy_rh(rh)
    type(ESMF_RouteHandle), intent(inout) :: rh
    integer :: rc
 
-   ! get rid of the route handle
    call ESMF_FieldRegridRelease(routehandle=rh, rc=rc)
    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
       call error_handler("IN FieldRegridRelease", rc)
@@ -843,7 +554,6 @@ subroutine radially_average(localpet,mpas_mesh,averaging_radius,input_bundle,out
    character(len=500), allocatable :: field_names(:)
    type(ESMF_Field), allocatable   :: input_fields(:), target_fields(:)
    real*8, allocatable :: dummy1(:), dummy2(:,:)
-   real(esmf_kind_r8), allocatable :: dum1d(:), dum2d(:,:)
    real(esmf_kind_r8), allocatable :: mean_1d(:), mean_2d(:,:)
    real(esmf_kind_r8), pointer     :: varptr(:), varptr2(:,:)
    integer, allocatable :: mask(:), num_points(:)
@@ -935,7 +645,6 @@ subroutine radially_average(localpet,mpas_mesh,averaging_radius,input_bundle,out
          nullify(varptr)
 
          deallocate(mean_1d, dummy1)
-        !deallocate(dum1d)
 
       else ! 3d variable
 
@@ -970,7 +679,6 @@ subroutine radially_average(localpet,mpas_mesh,averaging_radius,input_bundle,out
          nullify(varptr2)
 
          deallocate(mean_2d, dummy2)
-        !deallocate(dum2d)
       endif
 
    enddo
@@ -1162,52 +870,54 @@ subroutine apply_smoothing_filter(localpet,mpas_mesh,smoother_dimensionless_coef
 
 end subroutine apply_smoothing_filter
 
-recursive subroutine find_nearest_nonmissing_cell(my_cell, mpas_mesh, mpas_mesh2, data_full_field, output_cell, found_good_data)
+subroutine set_local_extrapolation_option(my_interp_method,my_extrap_method,extrapMethod)
+   character(len=*), intent(in) :: my_interp_method
+   character(len=*), intent(in) :: my_extrap_method
+   type(ESMF_ExtrapMethod_Flag), intent(inout) :: extrapMethod
 
-   integer, intent(in) :: my_cell
-   type(mpas_mesh_type), intent(in) :: mpas_mesh, mpas_mesh2
-   real*8, dimension(mpas_mesh2%nCells), intent(in) :: data_full_field ! full field on mesh2
-   integer,  intent(inout) :: output_cell
-   logical, intent(inout)  :: found_good_data
-
-   integer :: i, iCell, closest_cell
-   real*8  :: my_data
-
-   ! first get data from the central cell
-   closest_cell  = nearest_cell( mpas_mesh%latCell(my_cell), mpas_mesh%lonCell(my_cell), &
-                       1, mpas_mesh2%nCells, mpas_mesh2%maxEdges, &
-                       mpas_mesh2%nEdgesOnCell, mpas_mesh2%cellsOnCell , &
-                       mpas_mesh2%latCell, mpas_mesh2%lonCell)
-
-   ! if data at the input point is good, use that
-   my_data = data_full_field(closest_cell)
-   if ( my_data >= real(ignore_value) ) then 
-      found_good_data = .true.
-      output_cell = closest_cell
-      return
+   if (trim(adjustl(my_extrap_method)).eq."esmf_creep") then
+      extrapMethod = ESMF_EXTRAPMETHOD_CREEP
+   else if (trim(adjustl(my_extrap_method)).eq."esmf_creep_nrst_d") then
+      extrapMethod = ESMF_EXTRAPMETHOD_CREEP_NRST_D
+   else if (trim(adjustl(my_extrap_method)).eq."esmf_nearest_d") then
+      extrapMethod = ESMF_EXTRAPMETHOD_NEAREST_D
+   else if (trim(adjustl(my_extrap_method)).eq."esmf_nearest_stod") then
+      extrapMethod = ESMF_EXTRAPMETHOD_NEAREST_STOD
+   else if (trim(adjustl(my_extrap_method)).eq."mpas_nearest") then ! we'll use our own, non-esmf extrapolation
+      extrapMethod = ESMF_EXTRAPMETHOD_NONE
+   else if (trim(adjustl(my_extrap_method)).eq."none") then
+      extrapMethod = ESMF_EXTRAPMETHOD_NONE
+   else
+      call error_handler("Invalid extrapolation method = "//trim(adjustl(my_extrap_method)), -223)
    endif
 
-   ! data at input point not good. search the neighbors of the input cell for good data.
-   do i=1, mpas_mesh2%nEdgesOnCell(closest_cell)
-      iCell = mpas_mesh2%cellsOnCell(i, closest_cell)
-      my_data = data_full_field(iCell)
-      if ( my_data >= real(ignore_value) ) then
-         found_good_data = .true.
-         output_cell = iCell
-         exit ! get out of loop; effectively exit the routine
+end subroutine set_local_extrapolation_option
+
+! make sure the namelist-provided 'extrap_method' is appropriate
+! potentially updates namelist variable extrap_method
+subroutine set_global_extrapolation(localpet)
+   integer, intent(in) :: localpet
+   if ( regional_mesh ) then
+      if ( trim(adjustl(extrap_method)) .eq. "NULL" .or. &
+           trim(adjustl(extrap_method)) .eq. "NONE" .or.  &
+           trim(adjustl(extrap_method)) .eq. "none" ) then
+         if (localpet==0) write(*,*)'You must choose an extrapolation option for a regional mesh.'
+         call error_handler("Invalid extrapolation method = "//trim(adjustl(extrap_method)), -223)
       endif
-   end do
-
-   ! good data still not found. start looking outward
-   if ( .not. found_good_data ) then
-      do i=1, mpas_mesh2%nEdgesOnCell(closest_cell)
-         iCell = mpas_mesh2%cellsOnCell(i, closest_cell)
-         my_data = data_full_field(iCell) 
-         if ( my_data >= real(mask_value) ) cycle ! a bit risky, but a cell shouldn't be entirely surrounded by masked data in this case
-         call find_nearest_nonmissing_cell(iCell, mpas_mesh, mpas_mesh2, data_full_field, output_cell, found_good_data)
-         if ( found_good_data ) exit
-      end do
+      ! Can't use ESMF extrapolation with conservative interpolation
+      if ( trim(adjustl(interp_method)) .eq. "conserve1" .or. &
+           trim(adjustl(interp_method)) .eq. "conserve2" ) then
+         extrap_method = 'mpas_nearest'
+         if ( localpet == 0 ) write(*,*)'Resetting extrap_method = mpas_nearest b/c interp_method = '//trim(adjustl(interp_method))
+      endif
+      if ( localpet == 0 ) write(*,*)'Regional mesh: Using extrapolation method = '//trim(adjustl(extrap_method))
+      if ( trim(adjustl(extrap_method)) .eq. "esmf_creep" ) then
+         if (localpet == 0)write(*,*)'For esmf_creep, extrap_num_levels_creep = ',extrap_num_levels_creep
+      endif
+   else
+      extrap_method = 'none'
+      if ( localpet == 0 ) write(*,*)'Global mesh: No extrapolation needed.'
    endif
-end subroutine find_nearest_nonmissing_cell
+end subroutine set_global_extrapolation
 
 end module interp

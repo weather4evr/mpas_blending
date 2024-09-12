@@ -4,47 +4,49 @@ program mpas_blending
 
 use mpi
 use esmf
-use utils_mod, only      : error_handler, nearest_cell
-
+use utils_mod, only      : error_handler, print_dstStatus
 use program_setup, only  : LogType, read_setup_namelist,  &
                            large_scale_file, small_scale_file, grid_info_file, &
                            average_upscale_before_interp, &
                            output_intermediate_files_up, output_intermediate_files_down, &
-                           interp_method, output_latlon_grid, output_blended_filename, &
-                           dx_in_degrees, nvars_to_blend, smooth_going_downscale, smoother_dimensionless_coefficient, &
-                           max_boundary_layer_to_keep, regional_masking_method
+                           interp_method, extrap_method, extrap_method_latlon, output_latlon_grid, output_blended_filename, &
+                           dx_in_degrees, nvars_to_blend, smooth_going_downscale, smoother_dimensionless_coefficient
 use model_grid, only     : define_grid_mpas, define_grid_latlon, mpas_mesh_type, mpas_meshes, &
                            nmeshes, meshes, grid_files_heirarchy, read_grid_info_file, weights, &
                            latlon_grid, cleanup, cleanup_mpas_mesh_type, nominal_horizontal_cell_spacing, &
-                           find_interior_cell, extract_boundary_cells, find_mesh_boundary, mask_value, ignore_value
-                          !mask_info_type , update_mesh_mask
+                           mask_value, ignore_value, regional_mesh
 use input_data, only     : read_input_data, set_nVertLevelsPerVariable, &
                            input_data_error_checks, nVertLevelsPerVariable
-use interp, only         : make_rh, destroy_rh, interp_data, radially_average, apply_smoothing_filter, force_masked_data_to_missing, &
-                           extrapolate, &
-                           force_masked_data_to_value, force_certain_data_to_value, update_mask, extrapolate_nearest_neigh_on_impacted_points ! should in be bundles_mod
-use bundles_mod, only    : add_subtract_bundles, cleanup_bundle, define_bundle, &
-                           large_scale_data_going_up, small_scale_data_going_up, &
-                           large_scale_data_going_down, small_scale_data_going_down, &
-                           large_scale_data_perts, small_scale_data_perts, &
-                           large_scale_data_going_up_avg, small_scale_data_going_up_avg, &
-                           latlon_bundle, blending_bundle, &
-                           large_scale_data_going_up_nn, small_scale_data_going_up_nn
+use interp, only         : make_rh, destroy_rh, interp_data, radially_average, apply_smoothing_filter, &
+                           set_global_extrapolation, extrapolate, &
+                           force_masked_data_to_value, force_certain_data_to_value, update_mask  ! should in be bundles_mod
+use bundles_mod, only    : add_subtract_bundles, cleanup_bundle, define_bundle
 use write_data, only     : write_to_file, write_to_file_latlon
 
 implicit none
 
-integer                   :: ierr, localpet, npets, i, j, interior_cell, my_interior_cell
-integer                   :: nbdyCells !, cell_start, cell_end
-integer, allocatable      :: bdyCells(:), dstStatus(:)
+integer                   :: ierr, localpet, npets, i, j, ii, cell_start, cell_end, nCellsPerPET
+integer                   :: num_unmapped, num_unmapped_tot, my_num_unmapped
+integer, allocatable      :: dstStatus(:), my_dstStatus(:)
 real                      :: w1, w2
 character(len=500)        :: my_output_name
 character(len=5)          :: cell_dx, cell_degrees, iii
 type(esmf_vm)             :: vm
 type(esmf_fieldbundle), allocatable :: tmp_bundle(:)
-type(ESMF_RouteHandle)              :: rh, rh_nn
+type(ESMF_RouteHandle)              :: rh
 type(ESMF_RouteHandle), allocatable :: rh_latlon(:)
 integer(ESMF_KIND_I4), pointer :: unmappedDstList(:)
+
+type(esmf_fieldbundle), allocatable :: large_scale_data_going_up(:)
+type(esmf_fieldbundle), allocatable :: small_scale_data_going_up(:)
+type(esmf_fieldbundle), allocatable :: large_scale_data_going_down(:)
+type(esmf_fieldbundle), allocatable :: small_scale_data_going_down(:)
+type(esmf_fieldbundle), allocatable :: large_scale_data_perts(:)
+type(esmf_fieldbundle), allocatable :: small_scale_data_perts(:)
+type(esmf_fieldbundle), allocatable :: latlon_bundle(:)
+type(esmf_fieldbundle), allocatable :: blending_bundle(:)
+type(esmf_fieldbundle), allocatable :: large_scale_data_going_up_avg(:)
+type(esmf_fieldbundle), allocatable :: small_scale_data_going_up_avg(:)
 
 !------------------
 ! Initialize mpi
@@ -70,8 +72,7 @@ call ESMF_VMGet(vm, localPet=localpet, petCount=npets, rc=ierr)
 if(ESMF_logFoundError(rcToCheck=ierr,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__)) &
     call error_handler("IN VMGet", ierr)
 
-if (localpet==0) print*,'- NPETS IS  ',npets
-!print*,'- LOCAL PET ',localpet
+if (localpet==0) write(*,*)'- NPETS IS  ',npets
 
 !--------------------------------
 ! All processors read the namelist
@@ -90,6 +91,13 @@ allocate(mpas_meshes(nmeshes)) ! mpas_mesh_type type defined in model_grid
 do i = 1,nmeshes
    call define_grid_mpas(localpet, npets, grid_files_heirarchy(i), meshes(i), mpas_meshes(i)) ! output is meshes(i), mpas_meshes(i)
 enddo
+regional_mesh = mpas_meshes(1)%regional_mesh ! set the public variable defined in model_grid
+
+!--------------------------------------------
+! Check the extrapolation method set in the namelist.
+! The global variable 'extrap_method' could be modified
+!--------------------------------------------
+call set_global_extrapolation(localpet)
 
 !-----------------------------------------------------------------------------------------
 ! Error checking to make sure large_scale_file and small_scale_file have the same meshes.
@@ -101,7 +109,7 @@ call input_data_error_checks(large_scale_file,grid_files_heirarchy(1))
 
 ! Get the number of vertical levels for each variable that we are blending
 allocate(nVertLevelsPerVariable(nvars_to_blend)) ! from input_data module
-call set_nVertLevelsPerVariable(localpet,small_scale_file) ! sets nVertLevelsPerVariable and other vertical dimensions
+call set_nVertLevelsPerVariable(localpet,small_scale_file) ! sets nVertLevelsPerVariable and vertical dimensions
 
 !-----------------------------------------------------------------------------------------
 ! Define the bundles for i = 1,nmeshes, but don't associate any data with them yet.
@@ -113,13 +121,9 @@ call set_nVertLevelsPerVariable(localpet,small_scale_file) ! sets nVertLevelsPer
 !-----------------------------------------------------------------------------------------
 allocate(large_scale_data_going_up(nmeshes)) ! esmf_fieldbundle types
 allocate(small_scale_data_going_up(nmeshes))
-allocate(large_scale_data_going_up_nn(nmeshes))
-allocate(small_scale_data_going_up_nn(nmeshes))
 do i = 1,nmeshes
    call define_bundle(localpet,meshes(i),large_scale_data_going_up(i))
    call define_bundle(localpet,meshes(i),small_scale_data_going_up(i))
-   call define_bundle(localpet,meshes(i),large_scale_data_going_up_nn(i))
-   call define_bundle(localpet,meshes(i),small_scale_data_going_up_nn(i))
 enddo
 
 !----------------------------------------------
@@ -129,77 +133,12 @@ enddo
 call read_input_data(localpet,meshes(1),mpas_meshes(1),large_scale_file,large_scale_data_going_up(1)) ! data from file providing large scales
 call read_input_data(localpet,meshes(1),mpas_meshes(1),small_scale_file,small_scale_data_going_up(1)) ! data from file providing small scales
 
-! If our input data is regional, make an initial route-handle where we interpolate from the finest mesh (i=1)
-! to all other meshes in the heirarchy, and find those cells where the interpolation won't work
-! we then mask out all of those cells in the coarser resolution meshses and they are not 
-! active in interpolation
-if ( mpas_meshes(1)%regional_mesh .and. trim(adjustl(regional_masking_method)) .ne. "none" ) then
-   if ( trim(adjustl(regional_masking_method)) == "mpas_bdy" ) then
-      call find_interior_cell(localpet, mpas_meshes(1), interior_cell) ! return a global cellID (across whole mesh) we are pretty sure is in the interior
-      nbdyCells = count(mpas_meshes(1)%bdyMaskCell == max_boundary_layer_to_keep)
-      allocate(bdyCells(nbdyCells))
-      if (localpet==0) write(*,fmt='(a26,i5,a3,i5)')' mesh 1 num bdyMaskCell = ', max_boundary_layer_to_keep, ' : ',nbdyCells
-      call extract_boundary_cells(mpas_meshes(1), max_boundary_layer_to_keep, nbdyCells, bdyCells) ! get the cells on the mesh that make up the boundary
-   endif
-   if (localpet==0) write(*,fmt='(a31,i10)')' num masked cells for mesh    1 = ', count(mpas_meshes(1)%bdyMaskCell == mask_value)
-   do i = 1,nmeshes-1
-      if ( trim(adjustl(regional_masking_method)) == "esmf" ) then
-         allocate(dstStatus(mpas_meshes(i+1)%nCells))
-         ! make the ESMF routehandle for interpolation between the ith and (i+1)th mesh.
-         ! Main input is an esmf_fieldbundle on the ith (source) and (i+1)th (target) mesh. rh is the output (that we don't use...could not compute).
-         ! Also, optionally return a field that has the status of each destination point on the full grid (dstStatus).
-         call make_rh(localpet,large_scale_data_going_up(1), large_scale_data_going_up(i+1),trim(adjustl(interp_method)),rh,unmappedDstList,dstStatus)
-         !See 54.50 ESMF_REGRIDSTATUS for meaning of ESMF_REGRIDSTATUS_MAPPED
-         where (dstStatus < ESMF_REGRIDSTATUS_MAPPED ) mpas_meshes(i+1)%bdyMaskCell = mask_value
-         call destroy_rh(rh)
-         if (localpet == 0 ) then
-            do j = 0,8
-               write(*,*)'num status = ',j,' = ',count(dstStatus == j)
-            enddo
-         endif
-         deallocate(dstStatus)
-      else if ( trim(adjustl(regional_masking_method)) == "mpas_bdy" ) then
-         ! find the boundary on each mesh, based on the finest mesh (mpas_meshes(1))
-         ! then fill the region within the boundary, and set area outside of region to mask_value
-
-         ! find the point on the (i+1)th mesh corresponding to an interior_cell on the finest resolution mesh
-         my_interior_cell = nearest_cell( mpas_meshes(1)%latCell(interior_cell), mpas_meshes(1)%lonCell(interior_cell), &
-                                                      1, mpas_meshes(i+1)%nCells, mpas_meshes(i+1)%maxEdges, &
-                                                      mpas_meshes(i+1)%nEdgesOnCell, mpas_meshes(i+1)%cellsOnCell , &
-                                                      mpas_meshes(i+1)%latCell, mpas_meshes(i+1)%lonCell)
-         if (localpet==0) then
-            write(*,fmt='(a32,i4,a3,2f12.4)')'interior point lat/lon for mesh ',(i+1),' = ',mpas_meshes(i+1)%latCell(my_interior_cell)*180.0/3.14, &
-                                                                                            mpas_meshes(i+1)%lonCell(my_interior_cell)*180.0/3.14
-         endif
-
-         ! 5th entry .false. means don't also "mark" neighbors of the boundary
-         call find_mesh_boundary(localpet,my_interior_cell, nbdyCells, bdyCells, .false., mpas_meshes(1), mpas_meshes(i+1)) ! updates mpas_meshes(i+1)%bdyMaskCell (last argument)
-
-         ! it's possible that there could be a hole in the boundary on one of the meshes
-         ! if so, no cells will be masked
-         ! fill in the hole by marking the neighbors of points supposedly on the boundary
-         if ( count(mpas_meshes(i+1)%bdyMaskCell == mask_value) == 0 ) then
-            ! 5th entry .true. means DO "mark" neighbors of the boundary
-            if (localpet==0) write(*,fmt='(a,i4)')' filling a hole for mesh ',(i+1)
-            call find_mesh_boundary(localpet,my_interior_cell, nbdyCells, bdyCells, .true., mpas_meshes(1), mpas_meshes(i+1)) ! updates mpas_meshes(i+1)%bdyMaskCell (last argument)
-         endif
-      endif
-      ! mpas_meshes(i+1)%bdyMaskCell = mask_value at areas outside of the region determined by max_boundary_layer_to_keep
-      ! now update the mask on the esmf_mesh using mpas_meshes(i+1)%bdyMaskCell
-     !call ESMF_MeshTurnOnCellMask(meshes(i+1), mask_value, rc=ierr)
-     !call update_mesh_mask(meshes(i+1),mpas_meshes(i+1)) ! probably doesn't do anything b/c elementMasking may be broken
-      if (localpet==0) write(*,fmt='(a27,i4,a3,i10)')' num masked cells for mesh ',(i+1),' = ', count(mpas_meshes(i+1)%bdyMaskCell == mask_value)
-   enddo ! loop over the ith mesh
-   if ( trim(adjustl(regional_masking_method)) == "mpas_bdy" ) deallocate(bdyCells)
-endif ! is mpas_meshes(1)%regional_mesh == .true.
-
 !------------------------------------------------------------------------------------------------------
 ! Upscale the fields through the heirarchy for both large_scale_file and small_scale_file.
 ! Upscale from the ith grid to the (i+1)th grid.  Both input and output are esmf_fieldbundle type.
 ! large_scale_data_going_up(1) and small_scale_data_going_up(1) were filled in call to read_input_data
 ! Interpolation is a 3 step process:
-! 1) Make the routehandle.  Helpful to make it outside of the interpolation routine in case we want to
-!    use it repeatedly.
+! 1) Make the routehandle.  Helpful to make it outside of the interpolation routine so we can use it repeatedly.
 ! 2) Use the routehandle to do the interpolation.
 ! 3) Destroy the routehandle once we're done with it.
 !------------------------------------------------------------------------------------------------------
@@ -209,10 +148,13 @@ if ( average_upscale_before_interp ) then
 endif
 do i = 1,nmeshes-1
    ! make the ESMF routehandle for interpolation between the ith and (i+1)th mesh.
-   ! Main input is an esmf_fieldbundle on the ith (source) and (i+1)th (target) mesh. rh is the output.
+   ! Main input is an esmf_fieldbundle on the ith (source) and (i+1)th (target) mesh. rh is the output. Also return some information
+   !  about status of the interpolation at all the points on the target mesh. unmappedDstList is a list of the global MPAS cell IDs
+   !  where the target cell couldn't be mapped to the source grid, and is unique for each processor, while dstStatus is a field
+   !  on the full mesh
    allocate(dstStatus(mpas_meshes(i+1)%nCells))
-   call make_rh(localpet,large_scale_data_going_up(i), large_scale_data_going_up(i+1),trim(adjustl(interp_method)),rh, unmappedDstList, dstStatus)
-  !call make_rh(localpet,large_scale_data_going_up(i), large_scale_data_going_up(i+1),'nearest',rh_nn, unmappedDstList)
+   nullify(unmappedDstList)
+   call make_rh(localpet,large_scale_data_going_up(i), large_scale_data_going_up(i+1),trim(adjustl(interp_method)),trim(adjustl(extrap_method)), rh, unmappedDstList, dstStatus)
 
   ! If requested, average data on the current mesh to the scale of the next mesh, which is given by
   !   nominal_horizontal_cell_spacing(i+1)
@@ -225,77 +167,111 @@ do i = 1,nmeshes-1
       call radially_average(localpet,mpas_meshes(i),nominal_horizontal_cell_spacing(i+1),small_scale_data_going_up(i),small_scale_data_going_up_avg(i))
       call interp_data(localpet, rh, large_scale_data_going_up_avg(i), large_scale_data_going_up(i+1))
       call interp_data(localpet, rh, small_scale_data_going_up_avg(i), small_scale_data_going_up(i+1))
-     !call interp_data(localpet, rh_nn, large_scale_data_going_up_avg(i), large_scale_data_going_up_nn(i+1)) ! nearest-neighbor interp
-     !call interp_data(localpet, rh_nn, small_scale_data_going_up_avg(i), small_scale_data_going_up_nn(i+1))
    else 
       call interp_data(localpet, rh, large_scale_data_going_up(i), large_scale_data_going_up(i+1))
       call interp_data(localpet, rh, small_scale_data_going_up(i), small_scale_data_going_up(i+1))
-     !call interp_data(localpet, rh_nn, large_scale_data_going_up(i), large_scale_data_going_up_nn(i+1)) ! nearest-neighbor interp
-     !call interp_data(localpet, rh_nn, small_scale_data_going_up(i), small_scale_data_going_up_nn(i+1))
    endif
    call destroy_rh(rh)
-  !call destroy_rh(rh_nn)
 
-   if ( mpas_meshes(1)%regional_mesh ) then
-      ! The challenge with interpolating through a heirarchy is dealing with ESMF's missing values after an interpolation.
-      ! First, if a point cannot be interpolated to, ESMF sets the value to 0 on the target grid, which is annoying, b/c 0 is a physical
-      !  value.  So, force those points that can't be interpolated to to mask_value.
-      ! Second, there is the issue where certain points will be influenced by a masked-out point, but the points themselves aren't 
-      !  masked out. These points are identifiable, as they will be somehow related to a mask-out point, as defined by mask_value, 
-      !  and will be a large negative number.
+   if ( regional_mesh ) then
 
-      ! output of this next subroutine is e.g., updated large_scale_data_going_up(i+1) [third argument]
-      !    and mpas_mesh%bdyMaskCell (second argument) if fourth argument is true
-      ! set last argument to .false. in first call so as not to mess-up input to second call
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i+1), large_scale_data_going_up(i+1), .false. , mpas_meshes(i), large_scale_data_going_up(i) )
-     !if (localpet==0) write(*,fmt='(i4,a24,i4,a3,i10)')localpet,' num bdy=missing before ',(i+1),' = ', count(mpas_meshes(i+1)%bdyMaskCell == mask_value)
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i+1), small_scale_data_going_up(i+1), .true. , mpas_meshes(i),  small_scale_data_going_up(i) )
-     !if (localpet==0) write(*,fmt='(i4,a23,i4,a3,i10)')localpet,' num bdy=missing after ',(i+1),' = ', count(mpas_meshes(i+1)%bdyMaskCell == mask_value)
-
-      ! Where the field is masked, set to mask_value. If ESMF can't interpolate to a point, it will give values of 0,
-      !  and most of these will be where the field is masked
-      ! When we create the masks, we are looking at how the fields on i = 1 (the finest mesh) map to all other meshes.
-      ! But, the interpolation is from mesh i to (i+1), and we haven't dealt with masking in that case.
+      ! Where the field is masked, set to mask_value. If ESMF can't interpolate to a point via interpolation or extrapolation.
       ! When we made the routehandle, we returned dstStatus, which is the status of each interpolated point.  If dstStatus
       !  is certain values, that indicates the interpolation was not successful.  So, set those points to a masked value.
       !See 54.50 ESMF_REGRIDSTATUS for meaning of ESMF_REGRIDSTATUS_MAPPED
+      ! dstStatus = 8 for values that were extrapolated, and anything < 4 (ESMF_REGRIDSTATUS_MAPPED) means the point was not mapped
       where (dstStatus < ESMF_REGRIDSTATUS_MAPPED ) mpas_meshes(i+1)%bdyMaskCell = mask_value ! update the mask...useful for averaging
+      call print_dstStatus(localpet,dstStatus)
 
-      ! mpas_meshes(i+1)%bdyMaskCell now reflects the initial masks (from i = 1 to all other meshes), as well as from
-      ! interpolating from the i to i+1)th mesh.
-      ! This next call will ensure that where the field is masked, the fields in the bundle will be set to mask_val. 
-     !call force_masked_data_to_value(localpet,mpas_meshes(i+1),mpas_meshes(i+1)%bdyMaskCell,mask_value,mask_value,large_scale_data_going_up(i+1))
-     !call force_masked_data_to_value(localpet,mpas_meshes(i+1),mpas_meshes(i+1)%bdyMaskCell,mask_value,mask_value,small_scale_data_going_up(i+1))
+      ! for conservative interpolation, there's probably an ESMF bug and unmappedDstList will be incorrect
+      !  (it will have too many entries--possibly more than the size of the mesh!)
+      ! we can find the correct points by finding those with values < ESMF_REGRIDSTATUS_MAPPED.
+      num_unmapped = size(unmappedDstList)
+      call mpi_allreduce(num_unmapped, num_unmapped_tot, 1, mpi_integer, mpi_sum, mpi_comm_world, ierr)
+      if (localpet==0) write(*,*)'total num unmapped = ',num_unmapped_tot
 
-      if ( 1 == 1 ) then ! extrapolate
-         ! where points in the bundle are < ignore_value, but NOT equal to mask_value, use a nearest neighbor approach to fill it
-        !call extrapolate_nearest_neigh_on_impacted_points(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),mpas_meshes(i), large_scale_data_going_up(i))
-       !!call extrapolate_nearest_neigh_on_impacted_points(localpet,mpas_meshes(i+1),small_scale_data_going_up(i+1),mpas_meshes(i), small_scale_data_going_up(i))
-       !!call extrapolate_nearest_neigh_on_impacted_points(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),mpas_meshes(i), large_scale_data_going_up_nn(i+1))
-        !call extrapolate_nearest_neigh_on_impacted_points(localpet,mpas_meshes(i+1),small_scale_data_going_up(i+1),mpas_meshes(i), small_scale_data_going_up_nn(i+1))
+         ! Use our own MPAS-based extrapolation method to do nearest neighbor extrapolation
+         ! If a point is unmapped on the (i+1)th mesh, force the value at that point to the
+         !  value at the nearest point on the ith mesh.
+         ! Output is the 3rd argument, which is intent(inout) and is the updated bundle
+      if ( trim(adjustl(extrap_method)).eq."mpas_nearest" ) then
+
+         ! because of a likely ESMF bug about unmappedDstList when using conservative interpolation,
+         !  we need to redefine unmappedDstList, and find the unique points per processor where
+         ! the target points didn't map to the source grid
+         if ( trim(adjustl(interp_method)) .eq. "conserve1" .or. &
+              trim(adjustl(interp_method)) .eq. "conserve2" ) then 
+            cell_start = mpas_meshes(i+1)%cell_start
+            cell_end   = mpas_meshes(i+1)%cell_end
+            nCellsPerPET = mpas_meshes(i+1)%nCellsPerPET
+            allocate(my_dstStatus(1:nCellsPerPET))
+            my_dstStatus(1:nCellsPerPET) = dstStatus(cell_start:cell_end)
+            deallocate(unmappedDstList)
+            my_num_unmapped = count(my_dstStatus < ESMF_REGRIDSTATUS_MAPPED)
+            allocate(unmappedDstList(my_num_unmapped))
+            call mpi_allreduce(my_num_unmapped, num_unmapped_tot, 1, mpi_integer, mpi_sum, mpi_comm_world, ierr)
+            if (localpet==0) write(*,*)'NEW total num unmapped = ',num_unmapped_tot
+            ii = 0
+            do j = 1,nCellsPerPET
+               if ( my_dstStatus(j) < ESMF_REGRIDSTATUS_MAPPED ) then
+                  ii = ii + 1
+                  unmappedDstList(ii) = mpas_meshes(i+1)%elemIDs(j)
+               endif
+            enddo
+         endif
          call extrapolate(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),mpas_meshes(i),large_scale_data_going_up(i),unmappedDstList)
          call extrapolate(localpet,mpas_meshes(i+1),small_scale_data_going_up(i+1),mpas_meshes(i),small_scale_data_going_up(i),unmappedDstList)
-      else
-         ! where the bundle is < ignore_value, set the bundle to mask_value
-        !call force_certain_data_to_value(localpet,large_scale_data_going_up(i+1),'lt',ignore_value,mask_value)
-        !call force_certain_data_to_value(localpet,small_scale_data_going_up(i+1),'lt',ignore_value,mask_value)
+         if ( trim(adjustl(interp_method)) .eq. "conserve1" .or.  trim(adjustl(interp_method)) .eq. "conserve2" ) deallocate(unmappedDstList,my_dstStatus)
+
+         ! All interpolation options except esmf_creep fill the entire destination grid.
+         ! If using esmf_creep, that means some points will be unmapped.
+         ! Unfortunately, if a point cannot be interpolated to, ESMF sets the value to 0 on the target grid, which is annoying, b/c 0 is a physical
+         !  value.  So, force those points that can't be interpolated to --> mask_value.
+         ! Also, there is the issue where certain points will be influenced by a masked-out point, but the points themselves aren't 
+         !  masked out. These points are identifiable, as they will be somehow related to a masked-out point and will be a large 
+         ! negative number.  Force those points to mask_value, as well.
+         ! Note that for esmf_creep interpolation, the bigger extrap_num_levels_creep, the more areas outside of the region will be filled
+         !   and as extrap_num_levels_creep goes up, more values have dstStatus = 8.
+      else if ( trim(adjustl(extrap_method)) .eq. "esmf_creep" ) then
+         ! mpas_meshes(i+1)%bdyMaskCell reflects interpolating from the ith to (i+1)th mesh.
+         ! This call will ensure that where the field is masked, the fields in the bundle will be set to mask_val. 
+         ! Output is the final argument, which is intent(inout) and is the updated bundle
+         call force_masked_data_to_value(localpet,mpas_meshes(i+1),mpas_meshes(i+1)%bdyMaskCell,mask_value,mask_value,large_scale_data_going_up(i+1))
+         call force_masked_data_to_value(localpet,mpas_meshes(i+1),mpas_meshes(i+1)%bdyMaskCell,mask_value,mask_value,small_scale_data_going_up(i+1))
+
+         ! Where the bundle is < ignore_value, set the bundle to mask_value
+         ! Output is the 2nd argument, which is intent(inout) and is the updated bundle
+         call force_certain_data_to_value(localpet,large_scale_data_going_up(i+1),'lt',ignore_value,mask_value)
+         call force_certain_data_to_value(localpet,small_scale_data_going_up(i+1),'lt',ignore_value,mask_value)
+
+         ! where a field in the bundle large_scale_data_going_up(i+1) < ignore_value, set mpas_meshes(i+1)%bdyMaskCell = mask_value
+         ! masks are the same for all meshes, so just need to do for one field/bundle
+         call update_mask(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),ignore_value, mpas_meshes(i+1)%bdyMaskCell, mask_value)
       endif
-
-      ! where a field in the bundle large_scale_data_going_up(i+1) < ignore_value, set mpas_meshes(i+1)%bdyMaskCell = mask_value
-      ! masks are the same for all meshes, so just need to do for one field/bundle
-     !call update_mask(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),ignore_value, mpas_meshes(i+1)%bdyMaskCell, mask_value)
-
-      ! some non-masked points may have been influenced by masked points.
-      ! force those influenced points to missing, and then reset the elementMask in the mesh
-    !!call ESMF_MeshTurnOnCellMask(meshes(i+1), mask_value, rc=ierr)
-    !!call update_mesh_mask(meshes(i+1),mpas_meshes(i+1)) ! probably doesn't do anything b/c elementMasking may be broken
-   endif
+   endif ! if ( regional_mesh )
 
    deallocate(dstStatus)
 
    call mpi_barrier(mpi_comm_world, ierr) ! sync-up before going to next mesh
 
 enddo
+
+!----------------------------------------------------
+! If outputting on a lat/lon grid, set that up here
+!----------------------------------------------------
+if ( output_latlon_grid ) then
+   ! define the lat-lon grid and latlon_bundle
+   call define_grid_latlon(localpet,npets) ! defines latlon_grid in model_grid
+   allocate(latlon_bundle(nmeshes))  ! esmf_fieldbundle type
+   allocate(rh_latlon(nmeshes)) ! route-handle for the ith mesh to a common lat-lon grid
+   ! The same routehandle can be used for all fields/bundles when going from the ith mesh to 
+   !   the common lat-lon grid, which is why me make rh_latlon(i) up here and deallocate at the very end
+   do i = 1,nmeshes
+      call define_bundle(localpet,latlon_grid,latlon_bundle(i)) ! output is latlon_bundle(i)
+      call make_rh(localpet,large_scale_data_going_up(i), latlon_bundle(i), 'bilinear', trim(adjustl(extrap_method_latlon)), rh_latlon(i), unmappedDstList )
+   enddo
+   write(cell_degrees,fmt='(f5.3)') dx_in_degrees ! lat-lon grid cell size in degrees
+endif
 
 !-----------------------------------------
 ! Output the upscaled fields if requested
@@ -313,27 +289,13 @@ if ( output_intermediate_files_up ) then
       if ( average_upscale_before_interp .and. ( i .lt. nmeshes) ) then ! spatially smoothed/averaged fields only 1:nmeshes-1
          my_output_name = 'mpas_mesh_largeScaleData_goingUp_avg_'//trim(adjustl(cell_dx))//'km.nc'
          call write_to_file(localpet, mpas_meshes(i), large_scale_data_going_up_avg(i), .false., large_scale_file, my_output_name)
-        !my_output_name = 'mpas_mesh_smallScaleData_goingUp_avg'//trim(adjustl(cell_dx))//'km.nc'
-        !call write_to_file(localpet, mpas_meshes(i), small_scale_data_going_up_avg(i), .false., large_scale_file, my_output_name)
       endif
    enddo
 
    ! Output 1 file containing all the meshes interpolated to the same lat-lon grid
    if ( output_latlon_grid ) then
-      write(cell_degrees,fmt='(f5.3)') dx_in_degrees
-
-      ! define the lat-lon grid and latlon_bundle
-      call define_grid_latlon(localpet,npets) ! defines latlon_grid in model_grid
-      allocate(latlon_bundle(nmeshes))  ! esmf_fieldbundle type
-      do i = 1,nmeshes
-         call define_bundle(localpet,latlon_grid,latlon_bundle(i)) ! output is latlon_bundle(i)
-      enddo
-
       ! First output data from file providing large scales. Need to interpolate the data onto lat-lon grid first.
-      ! The same routehandle can be used for the large- and small-scale files.
-      allocate(rh_latlon(nmeshes))
       do i = 1,nmeshes
-         call make_rh(localpet,large_scale_data_going_up(i), latlon_bundle(i), 'bilinear', rh_latlon(i), unmappedDstList )
          call interp_data(localpet, rh_latlon(i), large_scale_data_going_up(i), latlon_bundle(i))
       enddo
       my_output_name = 'latlon_mesh_largeScaleData_goingUp_'//trim(adjustl(cell_degrees))//'degrees.nc'
@@ -342,9 +304,7 @@ if ( output_intermediate_files_up ) then
       ! Then output data from file providing small scales. Need to interpolate the data onto lat-lon grid first.
       do i = 1,nmeshes
          call interp_data(localpet, rh_latlon(i), small_scale_data_going_up(i), latlon_bundle(i))
-         call destroy_rh(rh_latlon(i))
       enddo
-      deallocate(rh_latlon)
       my_output_name = 'latlon_mesh_smallScaleData_goingUp_'//trim(adjustl(cell_degrees))//'degrees.nc'
       call write_to_file_latlon(localpet,nmeshes,latlon_bundle, my_output_name)
    endif
@@ -365,16 +325,15 @@ do i = 1,nmeshes-1
    call define_bundle(localpet,meshes(i),large_scale_data_going_down(i))
    call define_bundle(localpet,meshes(i),small_scale_data_going_down(i))
 
-   call make_rh(localpet, large_scale_data_going_up(i+1), large_scale_data_going_down(i), trim(adjustl(interp_method)), rh, unmappedDstList)
+   allocate(dstStatus(mpas_meshes(i)%nCells))
+   call make_rh(localpet, large_scale_data_going_up(i+1), large_scale_data_going_down(i), trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, unmappedDstList,dstStatus)
    call interp_data(localpet, rh, large_scale_data_going_up(i+1), large_scale_data_going_down(i))
    call interp_data(localpet, rh, small_scale_data_going_up(i+1), small_scale_data_going_down(i))
    call destroy_rh(rh)
 
-   if ( mpas_meshes(1)%regional_mesh ) then
-      ! output is e.g., updated large_scale_data_going_down(i) [third argument]
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i), large_scale_data_going_down(i), .false. )
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i), small_scale_data_going_down(i), .false. )
+   if ( regional_mesh ) then
 
+      call print_dstStatus(localpet,dstStatus)
       ! force 0s from the interpolation to mask_value
      !call force_masked_data_to_value(localpet,mpas_meshes(i),mpas_meshes(i)%bdyMaskCell,mask_value,mask_value,large_scale_data_going_down(i))
      !call force_masked_data_to_value(localpet,mpas_meshes(i),mpas_meshes(i)%bdyMaskCell,mask_value,mask_value,small_scale_data_going_down(i))
@@ -383,6 +342,8 @@ do i = 1,nmeshes-1
      !call force_certain_data_to_value(localpet,large_scale_data_going_down(i),'lt',ignore_value,mask_value)
      !call force_certain_data_to_value(localpet,small_scale_data_going_down(i),'lt',ignore_value,mask_value)
    endif
+
+   deallocate(dstStatus)
 
 enddo
 ! fill in the last (coarsest) element from the upscaled data
@@ -406,9 +367,8 @@ do i = 1, nmeshes-1
          large_scale_data_going_up(i), large_scale_data_going_down(i), 1.0, 1.0)
    small_scale_data_perts(i) = add_subtract_bundles(localpet, 'subtract', &
          small_scale_data_going_up(i), small_scale_data_going_down(i), 1.0, 1.0)
-   if ( mpas_meshes(1)%regional_mesh ) then
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i), large_scale_data_perts(i), .false. )
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i), small_scale_data_perts(i), .false. )
+
+   if ( regional_mesh ) then
 
       ! force perturbations in masked area to 0
      !call force_masked_data_to_value(localpet,mpas_meshes(i),mpas_meshes(i)%bdyMaskCell,mask_value,mask_value,large_scale_data_perts(i))
@@ -461,12 +421,10 @@ blending_bundle(i) = add_subtract_bundles(localpet,'add', large_scale_data_going
 !     on the finest-resolution mesh we want to output
 do i = nmeshes, 2, -1 ! loop from high to low
    if ( localpet == 0 ) write(*,*)'Blending for mesh ',i
-   call make_rh(localpet, blending_bundle(i),blending_bundle(i-1),trim(adjustl(interp_method)), rh, unmappedDstList)
+   call make_rh(localpet, blending_bundle(i),blending_bundle(i-1),trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, unmappedDstList)
    call interp_data(localpet,rh,blending_bundle(i),blending_bundle(i-1))
    call destroy_rh(rh)
-   if ( mpas_meshes(1)%regional_mesh ) then
-     !call force_masked_data_to_missing(localpet,mpas_meshes(i-1), blending_bundle(i-1), .false. )
-
+   if ( regional_mesh ) then
       ! force 0s from the interpolation to mask_value
      !call force_masked_data_to_value(localpet,mpas_meshes(i-1),mpas_meshes(i-1)%bdyMaskCell,mask_value,mask_value,blending_bundle(i-1))
 
@@ -484,8 +442,23 @@ do i = nmeshes, 2, -1 ! loop from high to low
 
    blending_bundle(i-1) = add_subtract_bundles(localpet, 'add', &
                     blending_bundle(i-1),tmp_bundle(i-1), 1.0, 1.0)
-
 enddo
+
+!---------------------------
+! Write blended data to file
+!-----------------------------
+! use small_scale_file as template for output file (because 4th argument is .true.)
+call write_to_file(localpet, mpas_meshes(1), blending_bundle(1), .true., small_scale_file, output_blended_filename)
+if ( localpet == 0 )write(*,*)'Done outputting blended file!' ! once you see this, the blended file has been successfully written
+
+call mpi_barrier(mpi_comm_world, ierr)
+
+! write blended data on lat-lon grid to file
+if ( output_latlon_grid ) then
+   call interp_data(localpet, rh_latlon(1), blending_bundle(1), latlon_bundle(1))
+   my_output_name = 'latlon_mesh_BlendedFields_'//trim(adjustl(cell_degrees))//'degrees.nc'
+   call write_to_file_latlon(localpet,1,latlon_bundle(1), my_output_name)
+endif
 
 !-----------------------------------------
 ! Output the downscaled fields if requested
@@ -496,62 +469,40 @@ if ( output_intermediate_files_down ) then
       my_output_name = 'mpas_mesh_largeScalePerts_'//trim(adjustl(cell_dx))//'km.nc'
       call write_to_file(localpet, mpas_meshes(i), large_scale_data_perts(i), .false., large_scale_file, my_output_name)
    enddo
-   do i = 2, nmeshes
-      write(cell_dx,fmt='(f5.1)') nominal_horizontal_cell_spacing(i)
-      my_output_name = 'mpas_mesh_blendingBundleStep_'//trim(adjustl(cell_dx))//'km.nc'
-      call write_to_file(localpet, mpas_meshes(i), blending_bundle(i), .false., large_scale_file, my_output_name)
-   enddo
+  !do i = 2, nmeshes
+  !   write(cell_dx,fmt='(f5.1)') nominal_horizontal_cell_spacing(i)
+  !   my_output_name = 'mpas_mesh_blendingBundleStep_'//trim(adjustl(cell_dx))//'km.nc'
+  !   call write_to_file(localpet, mpas_meshes(i), blending_bundle(i), .false., large_scale_file, my_output_name)
+  !enddo
    if ( output_latlon_grid ) then
-      write(cell_degrees,fmt='(f5.3)') dx_in_degrees
       do i = 1,nmeshes
-         call make_rh(localpet, small_scale_data_going_down(i), latlon_bundle(i), 'bilinear', rh, unmappedDstList)
-         call interp_data(localpet, rh, small_scale_data_going_down(i), latlon_bundle(i))
-         call destroy_rh(rh)
+         call interp_data(localpet, rh_latlon(i), small_scale_data_going_down(i), latlon_bundle(i))
       enddo
       my_output_name = 'latlon_mesh_smallScaleData_goingDown_'//trim(adjustl(cell_degrees))//'degrees.nc'
       call write_to_file_latlon(localpet,nmeshes-1,latlon_bundle, my_output_name)
 
       do i = 1,nmeshes-1
-         call make_rh(localpet, large_scale_data_perts(i), latlon_bundle(i), 'bilinear', rh, unmappedDstList)
-         call interp_data(localpet, rh, large_scale_data_perts(i), latlon_bundle(i))
-         call destroy_rh(rh)
+         call interp_data(localpet, rh_latlon(i), large_scale_data_perts(i), latlon_bundle(i))
       enddo
       my_output_name = 'latlon_mesh_largeScalePerts_'//trim(adjustl(cell_degrees))//'degrees.nc'
       call write_to_file_latlon(localpet,nmeshes-1,latlon_bundle, my_output_name)
    endif
 endif
  
-!--------------------------
-! Write blended data to file
-!--------------------------
-! use small_scale_file as template for output file (because 4th argument is .true.)
-call write_to_file(localpet, mpas_meshes(1), blending_bundle(1), .true., small_scale_file, output_blended_filename)
-
-call mpi_barrier(mpi_comm_world, ierr)
-
-if ( output_latlon_grid ) then
-   call make_rh(localpet, blending_bundle(1), latlon_bundle(1), 'bilinear', rh, unmappedDstList)
-   call interp_data(localpet, rh, blending_bundle(1), latlon_bundle(1))
-   call destroy_rh(rh)
-   write(cell_degrees,fmt='(f5.3)') dx_in_degrees
-   my_output_name = 'latlon_mesh_BlendedFields_'//trim(adjustl(cell_degrees))//'degrees.nc'
-   call write_to_file_latlon(localpet,1,latlon_bundle(1), my_output_name)
-endif
- 
 !-------------
 ! Clean up 
 !-------------
-! degbugging
 do i = 1,nmeshes
    !write(iii,fmt='(i5)') i
    call cleanup_bundle(large_scale_data_going_up(i))
    call cleanup_bundle(small_scale_data_going_up(i))
    call cleanup_bundle(blending_bundle(i))
    call cleanup_bundle(tmp_bundle(i))
-   call cleanup_bundle(large_scale_data_going_up_nn(i))
-   call cleanup_bundle(small_scale_data_going_up_nn(i))
-   if ( output_latlon_grid ) call cleanup_bundle(latlon_bundle(i))
    call cleanup_mpas_mesh_type(mpas_meshes(i))
+   if ( output_latlon_grid ) then
+      call cleanup_bundle(latlon_bundle(i))
+      call destroy_rh(rh_latlon(i))
+   endif
 enddo
 
 ! degbugging
@@ -562,31 +513,31 @@ do i = 1,nmeshes-1
    call cleanup_bundle(small_scale_data_perts(i))
    call cleanup_bundle(large_scale_data_going_down(i)) ! this is length nmeshes, but the entry for "nmeshes" is a pointer to large_scale_data_going_up ...
    call cleanup_bundle(small_scale_data_going_down(i)) !  which is deallocated above, so only need to deallocate these from 1:nmeshes-1
-enddo
-
-if ( average_upscale_before_interp ) then
-   do i = 1,nmeshes-1
+   if ( average_upscale_before_interp ) then
       call cleanup_bundle(large_scale_data_going_up_avg(i))
       call cleanup_bundle(small_scale_data_going_up_avg(i))
-   enddo
-   deallocate(large_scale_data_going_up_avg, small_scale_data_going_up_avg)
-endif
+   endif
+enddo
 
+if ( average_upscale_before_interp ) deallocate(large_scale_data_going_up_avg, small_scale_data_going_up_avg)
 deallocate(large_scale_data_going_up, small_scale_data_going_up)
 deallocate(large_scale_data_going_down, small_scale_data_going_down)
 deallocate(blending_bundle, tmp_bundle)
-if ( output_latlon_grid ) deallocate(latlon_bundle)
 deallocate(mpas_meshes)
 deallocate(large_scale_data_perts, small_scale_data_perts)
 deallocate(nVertLevelsPerVariable)
+if ( output_latlon_grid ) then 
+   deallocate(latlon_bundle)
+   deallocate(rh_latlon)
+endif
 
 call cleanup(localpet) ! deallocates variables allocated or defined in model_grid module
 
-if (localpet==0) print*,"- CALL ESMF_finalize"
+if (localpet==0) write(*,*)"- CALL ESMF_finalize"
 call ESMF_finalize(endflag=ESMF_END_KEEPMPI, rc=ierr)
 
 call mpi_finalize(ierr)
 
-print*,"- DONE."
+write(*,*)"- DONE."
 
 end program mpas_blending

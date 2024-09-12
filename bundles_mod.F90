@@ -19,21 +19,6 @@ interface define_bundle
    module procedure define_bundle_grid
 end interface
 
-! Public variables accessible to other modules
-type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_up(:)
-type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_up(:)
-type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_down(:)
-type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_down(:)
-type(esmf_fieldbundle), allocatable, public :: large_scale_data_perts(:)
-type(esmf_fieldbundle), allocatable, public :: small_scale_data_perts(:)
-type(esmf_fieldbundle), allocatable, public :: latlon_bundle(:)
-type(esmf_fieldbundle), allocatable, public :: blending_bundle(:)
-type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_up_avg(:)
-type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_up_avg(:)
-
-type(esmf_fieldbundle), allocatable, public :: large_scale_data_going_up_nn(:)
-type(esmf_fieldbundle), allocatable, public :: small_scale_data_going_up_nn(:)
-
 contains
 
 subroutine define_bundle_mesh(localpet,the_mesh,bundle)
@@ -49,7 +34,6 @@ subroutine define_bundle_mesh(localpet,the_mesh,bundle)
    allocate(fields(nvars_to_blend))
 
    do i = 1, nvars_to_blend
-
       if ( nVertLevelsPerVariable(i) .eq. 1) then ! filled in call to read_input_data
          fields(i) = ESMF_FieldCreate(the_mesh, &
                      typekind=ESMF_TYPEKIND_R8, &
@@ -149,28 +133,12 @@ function add_subtract_bundles(localpet,operation,bundle1,bundle2,w1,w2) result(b
     allocate(fields_out(nfields))
 
     call bundle_get_fields(bundle1, fields1)
-   !call ESMF_FieldBundleGet(bundle1, fieldList=fields1, &
-   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-   !                         rc=rc)
-   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-   !   call error_handler("IN EMSF_FieldBundleGet field1", rc)
-
     call bundle_get_fields(bundle2, fields2)
-   !call ESMF_FieldBundleGet(bundle2, fieldList=fields2, &
-   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-   !                         rc=rc)
-   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-   !   call error_handler("IN EMSF_FieldBundleGet field2", rc)
 
     ! define bundle_out
     call ESMF_FieldBundleGet(bundle1, mesh=the_mesh, rc=rc)
     call define_bundle(localpet, the_mesh, bundle_out)
     call bundle_get_fields(bundle_out, fields_out)
-   !call ESMF_FieldBundleGet(bundle_out, fieldList=fields_out, &
-   !                         itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-   !                         rc=rc)
-   !if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
-   !   call error_handler("IN EMSF_FieldBundleGet field_out", rc)
 
    ! compute perturbations
    do i = 1,nfields
@@ -251,9 +219,7 @@ subroutine cleanup_bundle(input_bundle)
 
    allocate(fields(nvars))
    call bundle_get_fields(input_bundle,fields)
-  !call ESMF_FieldBundleGet(input_bundle, fieldList=fields, &
-  !                      itemorderflag=ESMF_ITEMORDER_ADDORDER, &
-  !                      rc=rc)
+  
    do i = 1, nvars
       call ESMF_FieldDestroy(fields(i), rc=rc)
    enddo

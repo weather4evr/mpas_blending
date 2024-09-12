@@ -61,6 +61,7 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
       !--- open the file that we are outputting; nf90_create opens in define mode
       error = nf90_create(trim(adjustl(output_file)), NF90_NETCDF4, ncidout) ! make the type match the input file???
       call netcdf_err(error, 'CREATING FILE '//trim(adjustl(output_file)) )
+      write(*,*)'Writing '//trim(adjustl(output_file))
 
      !error = nf90_redef(ncidout) ! enter define mode
 
@@ -263,10 +264,15 @@ subroutine write_to_file(localpet,mpas_mesh,input_bundle,get_metadata_from_templ
 
    ! bdyCell-need to create the variable
    if (localpet ==0) then
-      dum1dt(:,1) = mpas_mesh%bdyMaskCell
+      dum1dt(:,1) = mpas_mesh%bdyMaskCellOrig
       error = nf90_def_var(ncidout, 'bdyMaskCell', NF90_INT, (/dim_ncells /), id_mask)
       error = nf90_put_var( ncidout, id_mask, dum1dt(:,1), start=(/1/), count=(/nCells/) )
       call netcdf_err(error, 'WRITING bdyMaskCell RECORD' )
+
+     !dum1dt(:,1) = mpas_mesh%bdyMaskCell
+     !error = nf90_def_var(ncidout, 'bdyMaskCell', NF90_INT, (/dim_ncells /), id_mask)
+     !error = nf90_put_var( ncidout, id_mask, dum1dt(:,1), start=(/1/), count=(/nCells/) )
+     !call netcdf_err(error, 'WRITING bdyMaskCell RECORD' )
    endif
 
    !times
@@ -399,6 +405,7 @@ subroutine write_to_file_latlon(localpet,nmeshes,input_bundle,output_file)
       !--- open the file
       error = nf90_create(output_file, NF90_NETCDF4, ncidout) ! make the type match the input file???
       call netcdf_err(error, 'CREATING FILE '//trim(output_file) )
+      write(*,*)'Writing '//trim(adjustl(output_file))
 
       !--- define dimensions
       error = nf90_def_dim(ncidout, 'nmeshes', NF90_UNLIMITED , dim_time) ! dim_time is a misnomer...
