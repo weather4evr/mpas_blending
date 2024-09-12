@@ -15,8 +15,8 @@
    smoother_dimensionless_coefficient = 0.1
    esmf_log = .true.
 /
-   extrap_method = 'esmf_nearest', 'esmf_creep', 'mpas_nearest'
-   interp_method = 'bilinear', interp_method = 'conserve1'
+!  interp_method options : 'bilinear', 'conserve1', 'conserve2', 'nearest', 'patch'
+!  extrap_method options : "esmf_creep", "esmf_creep_nrst_d", "esmf_nearest_d", "esmf_nearest_stod", "mpas_nearest"
 
 ! 0.25-degree global grid
 &latlon_output
