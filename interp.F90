@@ -65,21 +65,14 @@ subroutine interp_data(localpet,my_rh,input_bundle,target_bundle)
    
    do i = 1,nfields
    
-     !if (localpet==0) write(*,*)"- INTERPOLATING "//trim(adjustl(field_names(i)))//" with method "//trim(adjustl(my_interp_method))
-
-      ! testing about getting number of ungridded dimensions...can probably remove someday
-     !call ESMF_FieldGet(fields_input_grid(i),ungriddedDimCount=ungriddedDimCount, &
-     !           ungriddedLBound=ungriddedLBound, ungriddedUBound=ungriddedUBound ,rc=rc)
-     !if (localpet==0) write(*,*)'ungriddedDimCount = ',ungriddedDimCount
-     !if (localpet==0) write(*,*)'ungriddedLBound = ',ungriddedLBound
-     !if (localpet==0) write(*,*)'ungriddedUBound = ',ungriddedUBound
-      ! end test
-
       ! do the interpolation
       call ESMF_FieldRegrid(fields_input_grid(i), fields_target_grid(i), my_rh, rc=rc)
       if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
          call error_handler("IN FieldRegrid", rc)
 
+      ! testing about getting number of ungridded dimensions...can probably remove someday
+      !call ESMF_FieldGet(fields_input_grid(i),ungriddedDimCount=ungriddedDimCount, &
+      !          ungriddedLBound=ungriddedLBound, ungriddedUBound=ungriddedUBound ,rc=rc)
    enddo
 
   !if(localpet==0)write(*,*)'Done interpolating fields'
@@ -347,7 +340,6 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
 
       num_unmapped = size(unmappedPoints) ! unique to this processor
 
-     !if ( num_unmapped > 0 ) then
       do i = 1,nfields
          if ( nVertLevelsPerVariable(i) == 1 ) then
             call ESMF_FieldGet(fields(i), farrayPtr=varptr, rc=rc) ! varptr is decomposed across all processors
@@ -377,7 +369,7 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
                   endif
                enddo
             enddo
-            if(localpet == 0 ) write(*,*)'done extrapolating'
+           !if(localpet == 0 ) write(*,*)'done extrapolating'
             deallocate(dummy1)
             nullify(varptr)
          else
@@ -409,7 +401,7 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
                   endif
                enddo
             enddo
-            if(localpet == 0 ) write(*,*)'done extrapolating'
+           !if(localpet == 0 ) write(*,*)'done extrapolating'
             deallocate(dummy2)
             nullify(varptr2)
          endif
@@ -419,8 +411,6 @@ subroutine extrapolate(localpet,mpas_mesh,bundle,mpas_mesh2,bundle2,unmappedPoin
       call ESMF_FieldBundleAddReplace(bundle, fields, rc=rc)
       if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
          call error_handler("IN ESMF_FieldBundleAddReplace", rc)
-
-     !endif ! ( num_unmapped > 0 ) then
 
       ! clean-up
       deallocate(fields,fields2)
@@ -507,10 +497,8 @@ subroutine make_rh(localpet,input_bundle,target_bundle,my_interp_method,my_extra
                                extrapNumLevels=extrap_num_levels_creep, &
                                normType=ESMF_NORMTYPE_FRACAREA, &
                                rc=rc)
-                             ! extrapMethod=ESMF_EXTRAPMETHOD_CREEP, &
                              ! srcMaskValues=(/mask_value/), &
                              ! dstMaskValues=(/mask_value/), &
-                             ! extrapMethod=ESMF_EXTRAPMETHOD_NEAREST_D, &
    if(ESMF_logFoundError(rcToCheck=rc,msg=ESMF_LOGERR_PASSTHRU,line=__LINE__,file=__FILE__))&
       call error_handler("IN FieldRegridStore", rc)
 
