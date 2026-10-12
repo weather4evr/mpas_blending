@@ -7,7 +7,7 @@ use utils_mod, only : error_handler, sphere_distance, nearest_cell, gather_on_al
 use model_grid, only : mpas_mesh_type, mask_value, ignore_value, INSIDE, UNMARKED, regional_mesh
 use input_data, only : nVertLevelsPerVariable
 use bundles_mod, only : bundle_get_num_fields, bundle_get_fields, bundle_get_field_names
-use program_setup, only  : variables_to_blend, extrap_num_levels_creep, interp_method, extrap_method
+use program_setup, only  : variables_to_blend, extrap_num_levels_creep, interp_method_going_up, extrap_method
 
 implicit none
 
@@ -892,11 +892,13 @@ subroutine set_global_extrapolation(localpet)
          if (localpet==0) write(*,*)'You must choose an extrapolation option for a regional mesh.'
          call error_handler("Invalid extrapolation method = "//trim(adjustl(extrap_method)), -223)
       endif
-      ! Can't use ESMF extrapolation with conservative interpolation
-      if ( trim(adjustl(interp_method)) .eq. "conserve1" .or. &
-           trim(adjustl(interp_method)) .eq. "conserve2" ) then
+      ! Can't use ESMF extrapolation with conservative interpolation.
+      ! Base extrapolation method on the upscale interpolation approach,
+      !  since extrapolation shouldn't matter (i.e., be necessary) when going downscale
+      if ( trim(adjustl(interp_method_going_up)) .eq. "conserve1" .or. &
+           trim(adjustl(interp_method_going_up)) .eq. "conserve2" ) then
          extrap_method = 'mpas_nearest'
-         if ( localpet == 0 ) write(*,*)'Resetting extrap_method = mpas_nearest b/c interp_method = '//trim(adjustl(interp_method))
+         if ( localpet == 0 ) write(*,*)'Resetting extrap_method = mpas_nearest b/c interp_method_going_up = '//trim(adjustl(interp_method_going_up))
       endif
       if ( localpet == 0 ) write(*,*)'Regional mesh: Using extrapolation method = '//trim(adjustl(extrap_method))
       if ( trim(adjustl(extrap_method)) .eq. "esmf_creep" ) then

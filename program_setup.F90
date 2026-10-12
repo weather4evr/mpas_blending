@@ -22,6 +22,8 @@ character(len=500), public  :: small_scale_file = "NULL" ! Full path of MPAS fil
 character(len=500), public  :: output_blended_filename = "./blended.nc" ! Full path of output file to be created with blended fields
 character(len=500), public  :: grid_info_file = "NULL"   ! Full path of text file with information about meshes
 character(len=500), public  :: interp_method = "bilinear" ! Interpolation method
+character(len=500), public  :: interp_method_going_up = "NULL" ! Interpolation method when coarsening (going upscale)
+character(len=500), public  :: interp_method_going_down = "NULL" ! Interpolation method when going downscale (coarse to fine mesh)
 character(len=500), public  :: extrap_method = "mpas_nearest"     ! Extrapolation method; default is mpas_nearest
 integer, public             :: extrap_num_levels_creep = 64       ! extrap_method = 'esmf_creep' or 'esmf_creep_nrst_d' ; number of levels for creep fill
 character(len=500), public  :: variables_to_blend(nvars_max) = "NULL" ! netCDF variable names to blend
@@ -50,7 +52,7 @@ public :: read_setup_namelist
 
 ! Namelists
 namelist /share/ large_scale_file, small_scale_file, output_blended_filename, &
-         variables_to_blend, grid_info_file, interp_method, extrap_method, &
+         variables_to_blend, grid_info_file, interp_method, interp_method_going_up, interp_method_going_down,extrap_method, &
          extrap_num_levels_creep, average_upscale_before_interp, output_intermediate_files_up, &
          output_intermediate_files_down, output_upscaled_data_on_native_mesh, output_blended_edge_normal_wind, esmf_log, &
          smooth_going_downscale, smoother_dimensionless_coefficient
@@ -96,6 +98,18 @@ subroutine read_setup_namelist(filename,localpet)
    if ( dy_in_degrees == -9999. ) then
       dy_in_degrees = dx_in_degrees
       if (localpet == 0 ) write(*,*)'setting dy_in_degrees to dx_in_degrees = ',dy_in_degrees
+   endif
+
+   ! If interp_method_going_up isn't set in the namelist, set it to interp_method (for backwards compatibility)
+   if ( interp_method_going_up == "NULL" ) then
+      interp_method_going_up = interp_method
+      if (localpet == 0 ) write(*,*)'interp_method_going_up unset; setting to interp_method, which is ',interp_method
+   endif
+
+   ! If interp_method_going_down isn't set in the namelist, set it to interp_method (for backwards compatibility)
+   if ( interp_method_going_down == "NULL" ) then
+      interp_method_going_down = interp_method
+      if (localpet == 0 ) write(*,*)'interp_method_going_down unset; setting to interp_method, which is ',interp_method
    endif
 
 end subroutine read_setup_namelist

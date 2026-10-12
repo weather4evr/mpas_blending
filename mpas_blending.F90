@@ -10,7 +10,8 @@ use program_setup, only  : LogType, read_setup_namelist,  &
                            average_upscale_before_interp, &
                            output_intermediate_files_up, output_intermediate_files_down, &
                            output_upscaled_data_on_native_mesh, &
-                           interp_method, extrap_method, extrap_method_latlon, output_latlon_grid, &
+                           interp_method_going_up, interp_method_going_down, &
+                           extrap_method, extrap_method_latlon, output_latlon_grid, &
                            output_blended_filename, dx_in_degrees, nvars_to_blend, &
                            smooth_going_downscale, smoother_dimensionless_coefficient
 use model_grid, only     : define_grid_mpas, define_grid_latlon, mpas_mesh_type, mpas_meshes, &
@@ -125,8 +126,8 @@ call set_nVertLevelsPerVariable(localpet,small_scale_file)
 ! Data for the 1st mesh gets populated by read_input_data (below), and data for the
 !  2nd to ... Nth meshes will get filled in calls to interp_data.
 ! More broadly, define_bundle can be used to define any bundle and 
-!  associate that bundle with any "esmf_mesh " mesh (also can associate the
-!  bundle with any "esmf_grid" grid
+!  associate that bundle with any "esmf_mesh" mesh (also can associate the
+!  bundle with any "esmf_grid" grid)
 !-----------------------------------------------------------------------------------
 allocate(large_scale_data_going_up(nmeshes)) ! esmf_fieldbundle types
 allocate(small_scale_data_going_up(nmeshes))
@@ -166,7 +167,7 @@ do i = 1,nmeshes-1
    allocate(dstStatus(mpas_meshes(i+1)%nCells)) ! optional input
    nullify(unmappedDstList)
    call make_rh(localpet, large_scale_data_going_up(i), large_scale_data_going_up(i+1), &
-                trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, &
+                trim(adjustl(interp_method_going_up)), trim(adjustl(extrap_method)), rh, &
                 unmappedDstList, dstStatus)
 
   ! If requested, average data on the current mesh to the scale of the next mesh, 
@@ -214,8 +215,8 @@ do i = 1,nmeshes-1
          ! Because of a likely ESMF bug about unmappedDstList when using conservative interpolation,
          !  we need to redefine unmappedDstList and find the unique points on each processor where
          !  the target points didn't map to the source grid
-         if ( trim(adjustl(interp_method)) .eq. "conserve1" .or. &
-              trim(adjustl(interp_method)) .eq. "conserve2" ) then 
+         if ( trim(adjustl(interp_method_going_up)) .eq. "conserve1" .or. &
+              trim(adjustl(interp_method_going_up)) .eq. "conserve2" ) then 
             cell_start = mpas_meshes(i+1)%cell_start
             cell_end   = mpas_meshes(i+1)%cell_end
             nCellsPerPET = mpas_meshes(i+1)%nCellsPerPET
@@ -241,7 +242,7 @@ do i = 1,nmeshes-1
          ! Output is the 3rd argument, which is intent(inout) and is the updated bundle
          call extrapolate(localpet,mpas_meshes(i+1),large_scale_data_going_up(i+1),mpas_meshes(i),large_scale_data_going_up(i),unmappedDstList)
          call extrapolate(localpet,mpas_meshes(i+1),small_scale_data_going_up(i+1),mpas_meshes(i),small_scale_data_going_up(i),unmappedDstList)
-         if ( trim(adjustl(interp_method)) .eq. "conserve1" .or.  trim(adjustl(interp_method)) .eq. "conserve2" ) deallocate(unmappedDstList,my_dstStatus)
+         if ( trim(adjustl(interp_method_going_up)) .eq. "conserve1" .or.  trim(adjustl(interp_method_going_up)) .eq. "conserve2" ) deallocate(unmappedDstList,my_dstStatus)
 
          ! All extrapolation options except 'esmf_creep' fill the entire destination mesh.
          ! If using esmf_creep, some points will be unfilled on the destination mesh.
@@ -350,7 +351,7 @@ if ( output_intermediate_files_up ) then
       do i = 2,nmeshes
          write(cell_dx,fmt='(f7.1)') nominal_horizontal_cell_spacing(i)
          call make_rh(localpet, large_scale_data_going_up(i), bundle_for_interp_to_native_mesh, &
-                    trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, unmappedDstList)
+                    trim(adjustl(interp_method_going_up)), trim(adjustl(extrap_method)), rh, unmappedDstList)
          call interp_data(localpet, rh, large_scale_data_going_up(i), bundle_for_interp_to_native_mesh)
          ! output file. We can use large_scale_file (on the native mesh) as the template
          my_output_name = 'mpas_mesh_largeScaleData_goingUp_onNativeMesh_'//trim(adjustl(cell_dx))//'km.nc'
@@ -384,7 +385,7 @@ do i = 1,nmeshes-1
 
    allocate(dstStatus(mpas_meshes(i)%nCells))
    call make_rh(localpet, large_scale_data_going_up(i+1), large_scale_data_going_down(i), &
-                trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, unmappedDstList,dstStatus)
+                trim(adjustl(interp_method_going_down)), trim(adjustl(extrap_method)), rh, unmappedDstList,dstStatus)
    call interp_data(localpet, rh, large_scale_data_going_up(i+1), large_scale_data_going_down(i))
    call interp_data(localpet, rh, small_scale_data_going_up(i+1), small_scale_data_going_down(i))
    call destroy_rh(rh)
@@ -402,7 +403,7 @@ small_scale_data_going_down(nmeshes) = small_scale_data_going_up(nmeshes)
 ! Compute perturbations
 !--------------------------
 !function add_subtract_bundles(localpet,operation,bundle1,bundle2,w1,w2) result(bundle_out)
-!  add_subtract_bundles either adds or subracts based on value of operation (2nd entry):
+!  add_subtract_bundles either adds or subtracts based on value of operation (2nd entry):
 !  if 'subtract', it computes bundle1 minus bundle2 (third argument minus fourth argument)
 !  if 'add',      it does w1*bundle1 + w2*bundle2
 !  if 'subtract', w1 and w2 are ignored
@@ -452,10 +453,11 @@ blending_bundle(i) = add_subtract_bundles(localpet,'add', large_scale_data_going
 !       (step 1)
 !  4) Iterate; blending_bundle(1) is the reconstructed/blended field
 !     on the finest-resolution mesh we want to output
+! We really shouldn't have to worry about extrapolation when going downscale
 do i = nmeshes, 2, -1 ! loop from high to low
    if ( localpet == 0 ) write(*,*)'Blending for mesh ',i
    call make_rh(localpet, blending_bundle(i),blending_bundle(i-1), &
-                trim(adjustl(interp_method)), trim(adjustl(extrap_method)), rh, unmappedDstList)
+                trim(adjustl(interp_method_going_down)), trim(adjustl(extrap_method)), rh, unmappedDstList)
    call interp_data(localpet,rh,blending_bundle(i),blending_bundle(i-1))
    call destroy_rh(rh)
    if ( smooth_going_downscale ) then
